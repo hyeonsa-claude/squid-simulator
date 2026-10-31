@@ -1,14 +1,14 @@
-# The requests of access.log in the "site" format of tests/sim-custom.conf (%tg is UTC).
+# The requests of access.log in the "site" format of tests/sim-custom.conf (%tg is UTC and, as squid writes it, has no zone).
 # logformat site %>a %la [%tg] %Ss/%03>Hs %<st "%rm %ru" %tr "%{User-Agent}>h" %un
-10.0.0.5 192.168.0.1 [02/Nov/2026:01:00:00 +0000] TCP_MISS/200 1024 "GET http://www.example.com/" 120 "Mozilla/5.0 (X11; Linux x86_64)" -
-10.0.0.5 192.168.0.1 [02/Nov/2026:01:00:01 +0000] TCP_DENIED/403 3500 "GET http://x.ads.example.com/a.js" 0 "Mozilla/5.0 (X11; Linux x86_64)" -
-10.0.0.5 192.168.0.1 [02/Nov/2026:01:00:02 +0000] TCP_DENIED/403 3500 "GET http://www.example.com:8080/" 0 "curl/8.5.0" -
-10.0.0.5 192.168.0.1 [02/Nov/2026:01:00:03 +0000] TCP_TUNNEL/200 5000 "CONNECT www.example.com:443" 5012 "Mozilla/5.0 (X11; Linux x86_64)" -
-10.0.0.5 192.168.0.1 [02/Nov/2026:01:00:04 +0000] TCP_DENIED/403 3500 "CONNECT www.example.com:8443" 0 "Mozilla/5.0 (X11; Linux x86_64)" -
-10.0.0.5 192.168.0.1 [02/Nov/2026:01:00:05 +0000] TCP_DENIED/403 3500 "GET http://www.facebook.com/" 0 "Mozilla/5.0 (X11; Linux x86_64)" alice
-10.0.0.5 192.168.0.1 [31/Oct/2026:01:00:06 +0000] TCP_MISS/200 2048 "GET http://www.facebook.com/" 98 "Mozilla/5.0 (X11; Linux x86_64)" alice
-192.168.1.10 192.168.0.1 [02/Nov/2026:01:00:07 +0000] TCP_DENIED/403 3500 "GET http://www.example.com/" 0 "Mozilla/5.0 (X11; Linux x86_64)" -
+10.0.0.5 192.168.0.1 [02/Nov/2026:01:00:00] TCP_MISS/200 1024 "GET http://www.example.com/" 120 "Mozilla/5.0 (X11; Linux x86_64)" -
+10.0.0.5 192.168.0.1 [02/Nov/2026:01:00:01] TCP_DENIED/403 3500 "GET http://x.ads.example.com/a.js" 0 "Mozilla/5.0 (X11; Linux x86_64)" -
+10.0.0.5 192.168.0.1 [02/Nov/2026:01:00:02] TCP_DENIED/403 3500 "GET http://www.example.com:8080/" 0 "curl/8.5.0" -
+10.0.0.5 192.168.0.1 [02/Nov/2026:01:00:03] TCP_TUNNEL/200 5000 "CONNECT www.example.com:443" 5012 "Mozilla/5.0 (X11; Linux x86_64)" -
+10.0.0.5 192.168.0.1 [02/Nov/2026:01:00:04] TCP_DENIED/403 3500 "CONNECT www.example.com:8443" 0 "Mozilla/5.0 (X11; Linux x86_64)" -
+10.0.0.5 192.168.0.1 [02/Nov/2026:01:00:05] TCP_DENIED/403 3500 "GET http://www.facebook.com/" 0 "Mozilla/5.0 (X11; Linux x86_64)" alice
+10.0.0.5 192.168.0.1 [31/Oct/2026:01:00:06] TCP_MISS/200 2048 "GET http://www.facebook.com/" 98 "Mozilla/5.0 (X11; Linux x86_64)" alice
+192.168.1.10 192.168.0.1 [02/Nov/2026:01:00:07] TCP_DENIED/403 3500 "GET http://www.example.com/" 0 "Mozilla/5.0 (X11; Linux x86_64)" -
 this line is not an access.log line
-10.0.0.5 192.168.0.1 [02/Nov/2026:01:00:09 +0000] NONE_NONE/400 4000 "NONE error:invalid-request" 0 "-" -
-10.0.0.5 192.168.0.1 [02/Nov/2026:01:00:10 +0000] TCP_MISS/200 1024 "GET http://y.ads.example.com/" 77 "Mozilla/5.0 (X11; Linux x86_64)" -
-10.20.30.40 192.168.0.1 [02/Nov/2026:01:00:11 +0000] TCP_MISS/200 1024 "GET https://www.dup.example/" 65 "Mozilla/5.0 (X11; Linux x86_64)" -
+10.0.0.5 192.168.0.1 [02/Nov/2026:01:00:09] NONE_NONE/400 4000 "NONE error:invalid-request" 0 "-" -
+10.0.0.5 192.168.0.1 [02/Nov/2026:01:00:10] TCP_MISS/200 1024 "GET http://y.ads.example.com/" 77 "Mozilla/5.0 (X11; Linux x86_64)" -
+10.20.30.40 192.168.0.1 [02/Nov/2026:01:00:11] TCP_MISS/200 1024 "GET https://www.dup.example/" 65 "Mozilla/5.0 (X11; Linux x86_64)" -

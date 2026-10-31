@@ -15,6 +15,7 @@ Squid 소스에 패치로 붙어서, 판정은 Squid 자신의 설정 파서와 
 모든 기능은 `scripts/squid-sim` 하나로 실행합니다. `-m`이 없으면 인자를 패치한 squid로 넘기고, `-m`이 있으면
 실행 중인 squid의 캐시 매니저(`/squid-internal-mgr/`)를 읽습니다. 사이트마다 다른 로그 형식, 대상 squid.conf와
 로그 경로는 시뮬레이터 전용 설정 파일 [`squid-sim.conf`](squid-sim.conf)에서 관리합니다.
+전체 구성도와 기능별 흐름도(판정, 비교, 최적화, 로그 형식, 매니저, 빌드·검증)는 [docs/OVERVIEW.md](docs/OVERVIEW.md)에 모아 두었습니다.
 
 ## 브랜치
 
@@ -22,8 +23,8 @@ Squid 내부 API는 메이저 버전마다 달라서, 배포판의 squid 버전�
 
 | 브랜치 | 대상 OS | squid | 검증 |
 |---|---|---|---|
-| `main` | Ubuntu 20.04 LTS | 4.10 | Ubuntu 20.04.6에서 빌드·`make check` 94 PASS·기능 테스트 43개·배포판 squid 비교 통과 |
-| [`ubuntu-26.04-squid-7.7`](https://github.com/hyeonsa-claude/squid-simulator/tree/ubuntu-26.04-squid-7.7) | Ubuntu 26.04 LTS | 7.7 | Ubuntu 26.04.1에서 빌드·`make check` 103 PASS·기능 테스트 47개·배포판 squid 비교 통과 |
+| `main` | Ubuntu 20.04 LTS | 4.10 | Ubuntu 20.04.6에서 빌드·`make check` 94 PASS·기능 테스트 49개·배포판 squid 비교 통과 |
+| [`ubuntu-26.04-squid-7.7`](https://github.com/hyeonsa-claude/squid-simulator/tree/ubuntu-26.04-squid-7.7) | Ubuntu 26.04 LTS | 7.7 | Ubuntu 26.04.1에서 빌드·`make check` 103 PASS·기능 테스트 54개·배포판 squid 비교 통과 |
 
 ## 빠른 시작
 
@@ -270,6 +271,7 @@ Squid는 첫 매칭에서 멈추므로, 뒤에서 허용했을 규칙을 알려�
 
 ## 문서
 
+- [docs/OVERVIEW.md](docs/OVERVIEW.md): 전체 구성도와 흐름도 (squid 내부, 판정, 비교, 최적화, 로그 형식, 매니저, 빌드·검증)
 - [docs/USAGE.md](docs/USAGE.md): 로그 준비, 옵션, 출력 읽는 법, 최적화 항목 전체
 - [docs/MANAGER.md](docs/MANAGER.md): 캐시 매니저 조회·기록, 제외 규칙, 리포트 읽는 법
 - [docs/DESIGN.md](docs/DESIGN.md): 구조, 핵심 메커니즘, 소스 수정 내역
