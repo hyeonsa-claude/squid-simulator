@@ -271,6 +271,7 @@ Squid는 첫 매칭에서 멈추므로, 뒤에서 허용했을 규칙을 알려�
 
 ## 문서
 
+- [docs/DESIGN-VERIFICATION.md](docs/DESIGN-VERIFICATION.md): 설계·검증 문서 전체 (구조, 소스 수정 내역, 핵심 메커니즘, 재검토 결과, 한계)
 - [docs/OVERVIEW.md](docs/OVERVIEW.md): 전체 구성도와 흐름도 (squid 내부, 판정, 비교, 최적화, 로그 형식, 매니저, 빌드·검증)
 - [docs/USAGE.md](docs/USAGE.md): 로그 준비, 옵션, 출력 읽는 법, 최적화 항목 전체
 - [docs/MANAGER.md](docs/MANAGER.md): 캐시 매니저 조회·기록, 제외 규칙, 리포트 읽는 법

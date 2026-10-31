@@ -195,5 +195,6 @@ flowchart LR
 | [USAGE.md](USAGE.md) | 옵션, 출력 읽는 법, 최적화 항목 전체 |
 | [LOGFORMAT.md](LOGFORMAT.md) | squid-sim.conf, 로그 형식 판별과 변환 |
 | [MANAGER.md](MANAGER.md) | 캐시 매니저 조회·기록 |
+| [DESIGN-VERIFICATION.md](DESIGN-VERIFICATION.md) | 설계·검증 문서 전체 (재검토 결과 포함) |
 | [DESIGN.md](DESIGN.md) | 핵심 메커니즘, 소스 수정 내역 |
 | [VERIFICATION.md](VERIFICATION.md) | 검증 환경과 결과 |
