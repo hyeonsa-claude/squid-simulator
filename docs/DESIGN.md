@@ -102,21 +102,41 @@ Squid는 첫 매칭에서 멈추므로, 뒤에서 허용했을 규칙을 알려�
 두 개와 `src` ACL 300개를 비교해도 2.4초 걸립니다. 같은 값 비교로 `identical ACLs`(표기만 다른 경우 포함), `overlapping ACLs`,
 `ACL inside another ACL`, `partly shadowed rule`도 보고합니다.
 
+## 코드 주석 규칙
+
+저장소의 코드(시뮬레이터 C++, squid 소스에 더한 부분, `scripts/squid-sim`, 셸 스크립트)는 인라인 주석 없이,
+함수·클래스·전역마다 아래 형식의 기능 주석 하나로 설명합니다.
+
+```text
+########
+# 함수명 -> 출력
+# 어떻게 동작하는지
+########
+```
+
+| 언어 | 위치 |
+|---|---|
+| C++ | 정의 바로 위 `/* ... */` 안 (`#`으로 시작하는 줄은 C++에서 전처리 지시어라 블록 주석으로 감쌈) |
+| Python | 함수·클래스·메서드의 docstring (`help()`로도 보임) |
+| bash | 함수 바로 위, 스크립트 맨 위 |
+
+예외: squid 원본 코드의 주석은 그대로 둡니다. `globals.h`의 `/* 0 */`은 주석이 아니라 `mk-globals-c.awk`가 읽는 초기값이라 남깁니다.
+
 ## 소스 수정 내역 (squid 4.10)
 
 | 파일 | 줄 | 바꾼 내용 | 옵션 없이 실행할 때 영향 |
 |---|---|---|---|
-| `src/AclSimulator.cci` (신규) | +1559 | 로그 파싱, 재생, 다중 패스, 비교, 최적화, 터미널/HTML 출력 | 없음 |
-| `src/main.cc` | +81 / −2 | 긴 옵션 7개, 도움말, `.cci` 포함, 파싱 직후 `Run()` 후 종료 | 없음 |
-| `src/acl/Checklist.h`, `.cc` | +9, +7 | `Tracer`, `SkipRulesThrough`, `matchChild()`·`goAsync()`의 훅 호출 | 없음 (nullptr / −1) |
+| `src/AclSimulator.cci` (신규) | +2604 | 로그 파싱, 재생, 다중 패스, 비교, 최적화(ACL 값 비교 포함), 터미널/HTML 출력. 기능 주석 포함 | 없음 |
+| `src/main.cc` | +80 / −2 | 긴 옵션 7개, 도움말, `.cci` 포함, 파싱 직후 `Run()` 후 종료 | 없음 |
+| `src/acl/Checklist.h`, `.cc` | +24, +7 | `Tracer`, `SkipRulesThrough`, `matchChild()`·`goAsync()`의 훅 호출 | 없음 (nullptr / −1) |
 | `src/acl/Tree.cc` | +3 / −1 | `bannedAction()`의 위치 조건 | 없음 |
-| `src/acl/Acl.h`, `Acl.cc` | +34, +76 | `CollectConfigNotes`, 노트·참조·내장 ACL 기록 | 없음 (스위치 꺼짐) |
+| `src/acl/Acl.h`, `Acl.cc` | +80, +121 | `CollectConfigNotes`, 노트·참조·내장 ACL 기록 | 없음 (스위치 꺼짐) |
 | `src/acl/InnerNode.cc` | +1 | `NoteReference()` | 없음 |
 | `src/acl/DomainData.cc`, `Ip.cc`, `RegexData.cc` | +3, +5, +6 | 기존 경고 지점의 노트 기록 | 없음 |
-| `src/external_acl.cc` | +4 | helper 미초기화 시 DUNNO (NULL 역참조 방지) | 없음 (운영 중엔 항상 초기화) |
-| `src/ipcache.h`, `.cc` | +5, +63 | `ipcache_simulator_mode` 0/1/2 | 없음 (기본 0) |
-| `src/fqdncache.h`, `.cc` | +3, +40 | `fqdncache_simulator_mode` | 없음 (기본 0) |
-| `src/globals.h`, `src/cache_cf.cc` | +1, +7 / −3 | `opt_simulate`: 설정이 가리키는 파일(`mime.conf` 등)이 없어도 경고만 하고, `cache_log`를 열지 않음 | 없음 (기본 0) |
+| `src/external_acl.cc` | +3 | helper 미초기화 시 DUNNO (NULL 역참조 방지) | 없음 (운영 중엔 항상 초기화) |
+| `src/ipcache.h`, `.cc` | +9, +69 | `ipcache_simulator_mode` 0/1/2 | 없음 (기본 0) |
+| `src/fqdncache.h`, `.cc` | +8, +46 | `fqdncache_simulator_mode` | 없음 (기본 0) |
+| `src/globals.h`, `src/cache_cf.cc` | +1, +3 / −2 | `opt_simulate`: 설정이 가리키는 파일(`mime.conf` 등)이 없어도 경고만 하고, `cache_log`를 열지 않음 | 없음 (기본 0) |
 
 시뮬레이터 바깥의 `scripts/squid-sim`은 Python 스크립트로, 패치한 squid를 실행하는 진입점이자 실행 중인 squid의 캐시 매니저
 (`/squid-internal-mgr/`)를 읽는 도구입니다. 캐시 매니저 쪽은 Squid 소스를 고치지 않고 HTTP GET만 씁니다 ([MANAGER.md](MANAGER.md)).

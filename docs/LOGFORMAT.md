@@ -109,7 +109,7 @@ squid-sim: converted 179 lines to simulformat (0 did not match and are reported 
 |---|---|---|
 | 시각 `%tl` / `%tg` / `%ts` | 현재 시각 (경고 출력) | `acl time` |
 | `%la` | `local_ip`, 없으면 "주소 없음" | `localip`/`myip` ACL (squid.conf가 이 ACL을 쓰는데 값이 없으면 경고) |
-| `%rm` | URL에 `://`가 있으면 GET, 없으면 CONNECT | `method` ACL |
+| `%rm` | URL이 `호스트:포트`면 CONNECT, 아니면 GET | `method` ACL |
 | `%rv` | 1.1 | — |
 | `%>Hs`, `%<st` | `-` | 출력에만 쓰임 |
 | `%Ss` | `-` | 실제 로그와의 비교(`same`/`DIFF`)를 하지 않음 |
@@ -117,9 +117,25 @@ squid-sim: converted 179 lines to simulformat (0 did not match and are reported 
 나머지 코드(`%tr`, `%un`, `%{User-Agent}>h`, `%mt` 등)는 위치만 맞추고 버립니다. 너비·정렬·인코딩 수식어
 (`%6tr`, `%03>Hs`, `%[un`, `%"ru`)와 `{인자}`도 squid 문법대로 읽습니다.
 형식에 맞지 않는 줄은 줄 번호를 유지한 채 "건너뜀(SKIP)"으로 보고되고, 주석 줄과 빈 줄은 그대로 둡니다.
+`%"ru`처럼 따옴표 인코딩된 값은 따옴표를 벗기고 이스케이프를 풉니다. UTF-8이 아닌 바이트는 바꾸지 않고 그대로 넘깁니다.
 
-`%tl`은 프록시가 남긴 현지 시각이라 그대로 쓰지만, `%ts`·`%tg`는 UTC라서 `log_timezone`으로 현지 시각을
-만듭니다. 다른 타임존의 프록시 로그를 돌릴 때는 `log_timezone`을 꼭 맞춰 주세요.
+### 시각
+
+| 코드 | squid가 쓰는 형식 | 변환 |
+|---|---|---|
+| `%tl` | `02/Nov/2026:10:00:00 +0900` (현지 시각과 오프셋) | 그대로 씀 |
+| `%tg` | `02/Nov/2026:01:00:00` (UTC, 오프셋 없음) | `log_timezone`의 현지 시각으로 |
+| `%ts` | `1793581200` (UTC epoch) | `log_timezone`의 현지 시각으로 |
+| `%{strftime}tl`, `%{strftime}tg` | 지정한 형식 (예: `%{%Y-%m-%d %H:%M:%S}tl`) | 그 형식대로 읽음. `%z`가 있으면 그 오프셋, 없으면 `%tl`은 `log_timezone`, `%tg`는 UTC로 해석 |
+
+시각을 읽을 수 없는 줄은 맞지 않는 줄(SKIP)이 됩니다. 다른 타임존의 프록시 로그를 돌릴 때는 `log_timezone`을 꼭 맞춰 주세요.
+
+### 그 밖의 입력
+
+- **표준 입력:** `--simulate -`로 넘긴 로그는 먼저 임시 파일로 받아, 형식 판별과 변환이 같은 내용을 읽습니다.
+- **include:** squid.conf의 `include` 줄(glob 포함)을 따라가며 `logformat`, `access_log`, `http_port`를 찾습니다.
+  Ubuntu 26.04 기본 설정처럼 `conf.d/*.conf`에 로그 설정이 있어도 됩니다.
+- **옵션 표기:** `-f파일`처럼 붙여 쓴 값과 `--simul`처럼 줄인 긴 옵션도 squid와 같은 뜻으로 읽습니다.
 
 ## 검증
 

@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/AclSimulator.cci
-@@ -0,0 +1,2013 @@
+@@ -0,0 +1,2604 @@
 +/*
 + * Copyright (C) 1996-2020 The Squid Software Foundation and contributors
 + *
@@ -9,28 +9,21 @@
 + * Please see the COPYING and CONTRIBUTORS files for details.
 + */
 +
-+/* DEBUG: section 28    Access Control (offline simulator) */
++/*
++########
++# AclSimulator.cci -> 오프라인 http_access 시뮬레이터 (squid --simulate / --optimize)
++# main.cc가 #include 하는 단일 번역 단위라 Makefile을 고치지 않는다.
++# --simulate LOG: simulformat 로그(%tl %la %>a "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh)를 줄마다 가짜 HttpRequest로 만들어
++# 파싱된 squid.conf의 http_access에 fastCheck()로 넣고, 판정 규칙과 그 요청에 매칭되는 다른 규칙 전부를 보여 준다.
++# --sim-compare NEW: 같은 로그를 두 번째 squid.conf로도 재생해 판정이나 판정 규칙이 바뀐 요청만 보여 준다.
++# --optimize: 파서가 남긴 노트, ACL 값 비교, 규칙 포함 관계, 재생 결과로 고칠 거리를 찾는다.
++# --report FILE: 위 결과 전체를 HTML 한 파일로 쓴다.
++# 소켓을 열지 않고 아무것도 전달하지 않으며, 데몬화·포트 열기·캐시 초기화 전에 main()에서 갈라진다.
++########
++*/
 +
 +#ifndef SQUID_ACLSIMULATOR_H
 +#define SQUID_ACLSIMULATOR_H
-+
-+/*
-+ * Offline http_access simulator (squid --simulate access.log).
-+ *
-+ * Replays access.log lines written with
-+ *   logformat simulformat %tl %la %>a "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh
-+ * (fields are read by position, so the logformat name does not matter)
-+ * through the http_access rules of the parsed squid.conf and reports, for
-+ * every request, the deciding rule and every other rule that also matches.
-+ * No sockets are opened and nothing is forwarded.
-+ *
-+ * --sim-compare new.conf replays the same log through a second squid.conf
-+ * and lists the requests whose verdict or deciding rule changes.
-+ * --report out.html writes a self-contained HTML report.
-+ *
-+ * Included by main.cc only (single translation unit), so no build system
-+ * changes are needed.
-+ */
 +
 +#include "AccessLogEntry.h"
 +#include "acl/BoolOps.h"
@@ -70,18 +63,79 @@
 +namespace AclSimulator
 +{
 +
-+static const char *LogFile = nullptr; ///< --simulate FILE ("-" is stdin)
-+static const char *CompareConf = nullptr; ///< --sim-compare FILE
-+static const char *ReportFile = nullptr; ///< --report FILE
-+static bool Optimize = false; ///< --optimize
-+static bool ShowTrace = false; ///< --sim-trace
-+static int DnsMode = 1; ///< --sim-dns: 1 = off (hosts_file only), 2 = system resolver
-+static int LocalPortOption = -1; ///< --sim-port; defaults to the first http_port
++/*
++########
++# LogFile -> const char * (--simulate 인자)
++# 재생할 로그 경로. "-"는 표준 입력. nullptr이면 로그 재생 없이 --optimize만 한다.
++########
++*/
++static const char *LogFile = nullptr;
 +
-+/// at most this many rows per HTML report table
++/*
++########
++# CompareConf -> const char * (--sim-compare 인자)
++# 비교할 새 squid.conf 경로. nullptr이면 비교하지 않는다.
++########
++*/
++static const char *CompareConf = nullptr;
++
++/*
++########
++# ReportFile -> const char * (--report 인자)
++# HTML 리포트를 쓸 경로. nullptr이면 리포트를 쓰지 않는다.
++########
++*/
++static const char *ReportFile = nullptr;
++
++/*
++########
++# Optimize -> bool (--optimize)
++# true면 Analyze()로 설정 분석을 한다.
++########
++*/
++static bool Optimize = false;
++
++/*
++########
++# ShowTrace -> bool (--sim-trace)
++# true면 요청마다 규칙·ACL별 평가 과정을 출력한다.
++########
++*/
++static bool ShowTrace = false;
++
++/*
++########
++# DnsMode -> int (--sim-dns)
++# 1 = off: 조회하지 않고 hosts_file 항목만 쓴다. 2 = system: getaddrinfo()로 동기 조회한다.
++# ipcache_simulator_mode / fqdncache_simulator_mode에 그대로 넘긴다.
++########
++*/
++static int DnsMode = 1;
++
++/*
++########
++# LocalPortOption -> int (--sim-port)
++# 가짜 요청의 로컬 포트. -1이면 첫 http_port를 쓴다.
++########
++*/
++static int LocalPortOption = -1;
++
++/*
++########
++# ReportRowLimit -> size_t
++# HTML 리포트 표 하나에 넣는 최대 행 수. 큰 로그에서도 리포트가 열리도록 제한한다.
++########
++*/
 +static const size_t ReportRowLimit = 5000;
 +
-+/// one access.log line
++/*
++########
++# Record -> 클래스: 로그 한 줄
++# lineNo: 원본 줄 번호, parsed: 파싱 성공 여부, hasTime/when: %tl을 UTC epoch로 바꾼 값,
++# tzOffset: %tl의 UTC 오프셋(초, 동쪽이 양수), localIp(%la), clientIp(%>a), method(%rm), url(%ru), version(%rv),
++# status(%>Hs), squidStatus(%Ss).
++########
++*/
 +class Record
 +{
 +public:
@@ -89,89 +143,167 @@
 +    bool parsed = false;
 +    bool hasTime = false;
 +    time_t when = 0;
-+    int tzOffset = 0; ///< seconds east of UTC, from %tl
-+    std::string localIp, clientIp, method, url, version, host;
++    int tzOffset = 0;
++    std::string localIp, clientIp, method, url, version;
 +    std::string status, squidStatus;
 +};
 +
-+/// a rule that matched a request
++/*
++########
++# RuleMatch -> 클래스: 요청에 매칭된 규칙 하나
++# name: "http_access#N", action: allow, deny, 또는 그 규칙에서 검사가 멈춘 예외 응답(auth, dunno),
++# text: treeDump()로 얻은 규칙 줄 전체(이어 쓴 줄도 한 줄로).
++########
++*/
 +class RuleMatch
 +{
 +public:
-+    std::string name; ///< http_access#N
-+    std::string action; ///< allow, deny, or ? for exceptional answers
-+    std::string text; ///< squid.conf line
++    std::string name;
++    std::string action;
++    std::string text;
 +};
 +
-+/// how one squid.conf treats one request
++/*
++########
++# Decision -> 클래스: squid.conf 하나가 요청 하나를 판정한 결과
++# verdict: ALLOW, DENY, AUTH, DUNNO, SKIP. rule: 판정 규칙 이름, implicit, 또는 -. ruleText: 그 규칙 줄.
++# matches: 매칭되는 규칙 전부를 순서대로 (implicit이 아니면 [0]이 판정 규칙, 예외 응답으로 멈춘 규칙도 포함).
++# unsure: 오프라인에서 결과를 확정할 수 없는 ACL 이름들. trace: 규칙별 평가 과정(--sim-trace, 리포트용).
++# vsLog: 실제 로그와의 비교 same / DIFF / UNSURE / n/a (현재 설정에서만).
++# host: 이 설정으로 해석한 "호스트:포트". 설정(append_domain 등)마다 다를 수 있어 판정마다 따로 둔다.
++########
++*/
 +class Decision
 +{
 +public:
-+    std::string verdict = "SKIP"; ///< ALLOW, DENY, AUTH, DUNNO, SKIP
-+    std::string rule = "-"; ///< http_access#N, implicit, or -
++    std::string verdict = "SKIP";
++    std::string rule = "-";
 +    std::string ruleText;
-+    std::vector<RuleMatch> matches; ///< all matching rules in order; [0] decides unless implicit
-+    std::string unsure; ///< ACLs that need lookups we cannot do offline
-+    std::string trace; ///< rule-by-rule evaluation (kept for --sim-trace and the report)
-+    std::string vsLog = "n/a"; ///< same, DIFF, UNSURE, n/a (current config only)
++    std::vector<RuleMatch> matches;
++    std::string unsure;
++    std::string trace;
++    std::string vsLog = "n/a";
++    std::string host;
 +};
 +
-+/// a configured http_access rule
++/*
++########
++# RuleInfo -> 클래스: 설정된 http_access 규칙 하나
++# name, action, text, acls(규칙의 ACL 이름, 부정은 "!이름"),
++# decided: 이 규칙이 판정한 요청 수, shadowed: 앞 규칙이 이미 판정했지만 이 규칙에도 매칭된 요청 수.
++########
++*/
 +class RuleInfo
 +{
 +public:
 +    std::string name;
 +    std::string action;
 +    std::string text;
-+    std::vector<std::string> acls; ///< ACL names, "!name" when negated
-+    unsigned decided = 0; ///< requests this rule decided
-+    unsigned shadowed = 0; ///< requests it matched after an earlier rule decided
++    std::vector<std::string> acls;
++    unsigned decided = 0;
++    unsigned shadowed = 0;
 +};
 +
-+/// an --optimize result
++/*
++########
++# Finding -> 클래스: --optimize 결과 하나
++# severity: 3 HIGH, 2 MEDIUM, 1 LOW, 0 INFO. category: 항목 이름. subject: ACL 또는 규칙 이름.
++# where: 파일:줄 또는 squid.conf 줄. message: 설명. fix: 권장 조치.
++########
++*/
 +class Finding
 +{
 +public:
-+    int severity; ///< 3 high, 2 medium, 1 low
++    int severity;
 +    std::string category;
-+    std::string subject; ///< ACL or rule name
-+    std::string where; ///< file:line or the squid.conf line
++    std::string subject;
++    std::string where;
 +    std::string message;
 +    std::string fix;
 +};
 +
-+/// results of replaying the log through one squid.conf
++/*
++########
++# ConfigRun -> 클래스: 로그를 squid.conf 하나로 재생한 결과
++# path, rules, findings(--optimize), decisions(Records와 같은 순서),
++# traceAt: 리포트 묶음 키 -> 그 묶음의 평가 과정을 가진 decisions 인덱스,
++# allowed/denied/other/skipped/unsure/differ: 요청 수 집계, implicitHits: 어느 규칙에도 안 걸린 요청 수.
++########
++*/
 +class ConfigRun
 +{
 +public:
 +    std::string path;
 +    std::vector<RuleInfo> rules;
-+    std::vector<Finding> findings; ///< --optimize results
-+    std::vector<Decision> decisions; ///< parallel to Records
-+    std::map<std::string, size_t> traceAt; ///< group key -> decision index holding its trace
++    std::vector<Finding> findings;
++    std::vector<Decision> decisions;
++    std::map<std::string, size_t> traceAt;
 +    unsigned allowed = 0, denied = 0, other = 0, skipped = 0, unsure = 0, differ = 0;
 +    unsigned implicitHits = 0;
 +};
 +
++/*
++########
++# Records -> std::vector<Record>
++# ReadLog()가 읽은 로그 줄 전부. 두 설정을 같은 순서로 재생하는 기준이다.
++########
++*/
 +static std::vector<Record> Records;
-+static ConfigRun Runs[2]; ///< current and (with --sim-compare) new squid.conf
-+static bool Color = false; ///< ANSI colors on a terminal
 +
-+/// one evaluated ACL tree node, reported by ACLChecklist::Tracer
++/*
++########
++# Runs -> ConfigRun[2]
++# [0]은 현재 squid.conf, [1]은 --sim-compare의 새 squid.conf 결과.
++########
++*/
++static ConfigRun Runs[2];
++
++/*
++########
++# Color -> bool
++# 표준 출력이 터미널이면 true. Paint()가 ANSI 색을 붙일지 정한다.
++########
++*/
++static bool Color = false;
++
++/*
++########
++# Step -> 클래스: 평가된 ACL 트리 노드 하나
++# ACLChecklist::Tracer가 알려 준 (부모 노드, 노드, 결과 1/0). 부모가 Acl::Tree면 규칙 단위, 규칙이면 ACL 단위 결과다.
++########
++*/
 +class Step
 +{
 +public:
 +    const Acl::InnerNode *parent;
 +    const ACL *node;
-+    int result; ///< 1 match, 0 mismatch
++    int result;
 +};
 +
-+static std::vector<Step> Steps; ///< evaluation order of the current check
-+/// ACLs whose result offline is a guess: they wanted an async lookup or
-+/// they test data that the access.log format does not record
++/*
++########
++# Steps -> std::vector<Step>
++# 지금 진행 중인 fastCheck() 한 번의 평가 순서. 매 패스 전에 비운다.
++########
++*/
++static std::vector<Step> Steps;
++
++/*
++########
++# Skipped -> std::set<std::string>
++# 오프라인에서 결과가 추측일 수밖에 없는 ACL 이름. 비동기 조회가 필요했거나(goAsync 거절),
++# 로그에 없는 데이터를 보는 타입(NoLogData)이다.
++########
++*/
 +static std::set<std::string> Skipped;
 +
-+/// ACL types that test data missing from "%tl %la %>a "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh"
++/*
++########
++# NoLogData -> std::set<std::string>
++# simulformat 로그에 없는 데이터(헤더, 인증, helper, 연결 상태, 응답 등)를 보는 ACL 타입.
++# 이 타입의 결과는 판정에 영향을 주면 UNSURE로 표시한다.
++########
++*/
 +static const std::set<std::string> NoLogData = {
 +    "browser", "referer_regex", "req_header", "req_mime_type", "rep_header", "rep_mime_type",
 +    "http_status", "hier_code", "peername", "peername_regex", "maxconn", "max_user_ip",
@@ -180,6 +312,13 @@
 +    "clientside_mark", "client_connection_mark", "adaptation_service", "arp", "eui64", "random"
 +};
 +
++/*
++########
++# Trace -> void (ACLChecklist::Tracer 콜백)
++# matchChild()가 노드를 평가할 때마다 불린다. result -1(비동기 거절)이거나 NoLogData 타입이면 Skipped에 넣고,
++# -1이 아니면 Steps에 (부모, 노드, 결과)를 쌓는다.
++########
++*/
 +static void
 +Trace(const ACLChecklist *, const Acl::InnerNode *parent, const ACL *child, int result)
 +{
@@ -191,8 +330,12 @@
 +    Steps.push_back(Step{parent, child, result});
 +}
 +
-+/* access.log parsing */
-+
++/*
++########
++# MonthNumber -> int (0~11, 모르면 -1)
++# "Jan"~"Dec"를 대소문자 구분 없이 월 번호로 바꾼다.
++########
++*/
 +static int
 +MonthNumber(const char *mon)
 +{
@@ -206,7 +349,13 @@
 +    return -1;
 +}
 +
-+/// parses %tl ("31/Oct/2026:09:59:01" "+0900")
++/*
++########
++# ParseTime -> bool (성공하면 r.when, r.tzOffset, r.hasTime 설정)
++# %tl의 두 토큰("31/Oct/2026:09:59:01", "+0900")을 읽어, 현지 시각을 timegm()으로 epoch로 만든 뒤
++# 오프셋을 빼서 UTC epoch를 얻는다. 오프셋은 Evaluate()가 TZ로 되돌려 쓰도록 보관한다.
++########
++*/
 +static bool
 +ParseTime(const std::string &date, const std::string &zone, Record &r)
 +{
@@ -235,7 +384,13 @@
 +    return true;
 +}
 +
-+/// parses: %tl %la %>a "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh
++/*
++########
++# ParseLine -> bool (성공하면 Record 필드 설정)
++# simulformat 한 줄을 위치로 읽는다. 첫 따옴표 앞: 날짜, 오프셋, %la, %>a. 따옴표 안: 메서드, URL, 마지막이 HTTP/x.y면 버전.
++# 마지막 따옴표 뒤: 상태, 크기, %Ss:%Sh에서 %Ss만. 따옴표가 없거나 클라이언트·메서드·URL이 없으면 false(SKIP).
++########
++*/
 +static bool
 +ParseLine(const std::string &line, Record &r)
 +{
@@ -265,7 +420,6 @@
 +    r.url = words[1];
 +    for (size_t i = 2; i < words.size(); ++i)
 +        r.url += " " + words[i];
-+    r.host = r.url;
 +
 +    std::istringstream tail(line.substr(q2 + 1));
 +    std::string size, tags;
@@ -274,9 +428,13 @@
 +    return true;
 +}
 +
-+/* helpers */
-+
-+/// makes localtime() (and thus "acl time") use the proxy's logged UTC offset
++/*
++########
++# UseLogTimezone -> void
++# TZ 환경 변수를 로그의 오프셋으로 바꿔 localtime()과 acl time이 프록시 현지 시각으로 동작하게 한다.
++# POSIX TZ는 서쪽이 양수라 부호를 뒤집어 "SIM-09:00"처럼 쓰고, 같은 오프셋이면 다시 설정하지 않는다.
++########
++*/
 +static void
 +UseLogTimezone(const int offset)
 +{
@@ -286,13 +444,18 @@
 +    current = offset;
 +    const int a = offset < 0 ? -offset : offset;
 +    char tz[32];
-+    // POSIX TZ offsets count west of UTC, hence the inverted sign
 +    snprintf(tz, sizeof(tz), "SIM%c%02d:%02d", offset > 0 ? '-' : '+', a / 3600, (a % 3600) / 60);
 +    setenv("TZ", tz, 1);
 +    tzset();
 +}
 +
-+/// what Squid logged for this request: "DENY", "ALLOW", or "" (unknown)
++/*
++########
++# LoggedVerdict -> const char * ("DENY", "ALLOW", 또는 "")
++# 로그의 %Ss가 실제로 무엇이었는지. TCP_DENIED*(TCP_DENIED_REPLY 제외)는 DENY,
++# 비었거나 -, NONE*, TAG_NONE*은 판단할 수 없어 "", 나머지는 ALLOW.
++########
++*/
 +static const char *
 +LoggedVerdict(const Record &r)
 +{
@@ -304,6 +467,12 @@
 +    return "ALLOW";
 +}
 +
++/*
++########
++# VerdictName -> const char * (ALLOW, DENY, AUTH, DUNNO)
++# fastCheck() 응답을 출력용 이름으로 바꾼다.
++########
++*/
 +static const char *
 +VerdictName(const allow_t &answer)
 +{
@@ -316,7 +485,12 @@
 +    return "DUNNO";
 +}
 +
-+/// zero-based position of a rule from its "http_access#N" name
++/*
++########
++# RulePosition -> int (0부터, 이름이 아니면 -1)
++# "http_access#N"에서 N-1을 얻는다. SkipRulesThrough와 rules 배열 인덱스로 쓴다.
++########
++*/
 +static int
 +RulePosition(const std::string &name)
 +{
@@ -324,7 +498,12 @@
 +    return hash == std::string::npos ? -1 : atoi(name.c_str() + hash + 1) - 1;
 +}
 +
-+/// "http_access#5" -> "#5"
++/*
++########
++# Short -> std::string ("#N")
++# "http_access#5"처럼 긴 규칙 이름을 "#5"로 줄인다. #이 없으면 그대로.
++########
++*/
 +static std::string
 +Short(const std::string &name)
 +{
@@ -332,6 +511,12 @@
 +    return hash == std::string::npos ? name : name.substr(hash);
 +}
 +
++/*
++########
++# Upper -> std::string
++# ASCII 대문자로 바꾼 사본.
++########
++*/
 +static std::string
 +Upper(std::string s)
 +{
@@ -340,6 +525,12 @@
 +    return s;
 +}
 +
++/*
++########
++# Lower -> std::string
++# ASCII 소문자로 바꾼 사본. ACL 이름은 대소문자를 구분하지 않으므로 비교 키로 쓴다.
++########
++*/
 +static std::string
 +Lower(std::string s)
 +{
@@ -348,7 +539,12 @@
 +    return s;
 +}
 +
-+/// a squid.conf line without its trailing "# comment" (ACL and rule lines only)
++/*
++########
++# ConfLine -> std::string
++# squid.conf 줄에서 공백이나 탭 뒤의 "# 주석"과 끝 공백을 지운다. ACL·규칙 줄을 보여 줄 때 쓴다.
++########
++*/
 +static std::string
 +ConfLine(const char *cfgline)
 +{
@@ -364,12 +560,24 @@
 +    return line;
 +}
 +
++/*
++########
++# Paint -> std::string
++# Color가 켜져 있으면 ANSI 색 코드로 감싸고, 아니면 그대로 돌려준다.
++########
++*/
 +static std::string
 +Paint(const std::string &s, const char *code)
 +{
 +    return Color ? "\033[" + std::string(code) + "m" + s + "\033[0m" : s;
 +}
 +
++/*
++########
++# VerdictColor -> const char * (ANSI 색 코드)
++# ALLOW 초록, DENY 빨강, 나머지 노랑.
++########
++*/
 +static const char *
 +VerdictColor(const std::string &verdict)
 +{
@@ -380,6 +588,12 @@
 +    return "1;33";
 +}
 +
++/*
++########
++# Pad -> std::string
++# width보다 짧으면 오른쪽을 공백으로 채운다.
++########
++*/
 +static std::string
 +Pad(std::string s, const size_t width)
 +{
@@ -388,8 +602,13 @@
 +    return s;
 +}
 +
-+/// the answer when no rule matches: the opposite of the last rule action;
-+/// the rule named by without is treated as deleted
++/*
++########
++# ImplicitVerdict -> std::string (ALLOW, DENY, 또는 DUNNO)
++# 어떤 규칙도 매칭되지 않을 때의 판정 = 마지막 규칙 동작의 반대. without에 준 규칙은 지워진 것으로 보고
++# 그 앞 규칙을 마지막으로 친다. 규칙이 없으면 DUNNO.
++########
++*/
 +static std::string
 +ImplicitVerdict(const ConfigRun &run, const std::string &without = std::string())
 +{
@@ -400,16 +619,29 @@
 +    return "DUNNO";
 +}
 +
-+/// what would happen if the deciding rule were removed
++/*
++########
++# WithoutDecisive -> std::string ("DENY by http_access#9" 형식)
++# 판정 규칙이 없었다면의 결과. AUTH/DUNNO처럼 검사가 멈췄으면 그 뒤는 평가하지 않았으므로 알 수 없다고 답한다.
++# 두 번째로 매칭된 규칙이 있으면 그 규칙(예외 응답이면 AUTH 등), 없으면 그 규칙을 뺀 기본 판정.
++########
++*/
 +static std::string
 +WithoutDecisive(const Decision &d, const ConfigRun &run)
 +{
++    if (d.verdict != "ALLOW" && d.verdict != "DENY")
++        return "not known (the check stopped with " + d.verdict + ")";
 +    if (d.matches.size() >= 2)
 +        return Upper(d.matches[1].action) + " by " + d.matches[1].name;
 +    return ImplicitVerdict(run, d.rule) + " by implicit rule";
 +}
 +
-+/// "#5 deny > #9 allow > #12 allow"
++/*
++########
++# MatchChain -> std::string ("#5 deny > #9 allow" 형식, 없으면 none)
++# 요청에 매칭되는 규칙 전부를 평가 순서대로 잇는다.
++########
++*/
 +static std::string
 +MatchChain(const Decision &d)
 +{
@@ -424,6 +656,12 @@
 +    return chain;
 +}
 +
++/*
++########
++# FirstMatching -> std::string (규칙 이름 또는 "")
++# 매칭 목록에서 action이 주어진 동작인 첫 규칙. 차단된 요청을 허용했을 규칙을 찾을 때 쓴다.
++########
++*/
 +static std::string
 +FirstMatching(const Decision &d, const char *action)
 +{
@@ -434,6 +672,12 @@
 +    return "";
 +}
 +
++/*
++########
++# WasSkipped -> bool
++# 노드가 Skipped에 있는지. "!이름" 노드는 부정하기 전의 ACL 이름으로도 확인한다.
++########
++*/
 +static bool
 +WasSkipped(const ACL *node)
 +{
@@ -441,9 +685,44 @@
 +    return Skipped.count(name) || (name[0] == '!' && Skipped.count(name + 1));
 +}
 +
-+/// rule-by-rule evaluation of the last check
++/*
++########
++# HostOf -> std::string ("호스트:포트", URL을 못 읽었으면 URL)
++# 판정에 기록된 목적지. 리포트의 묶음 키와 표에 쓴다.
++########
++*/
 +static std::string
-+FormatTrace(const Acl::Tree *tree)
++HostOf(const Record &r, const Decision &d)
++{
++    return d.host.empty() ? r.url : d.host;
++}
++
++/*
++########
++# RuleText -> std::string (규칙 줄 전체)
++# 규칙 노드의 줄을 treeDump() 결과(run.rules)에서 가져온다. cfgline은 이어 쓴 줄의 마지막 물리 줄만 담기 때문이다.
++# 위치를 알 수 없으면 cfgline을 쓴다.
++########
++*/
++static std::string
++RuleText(const ConfigRun &run, const ACL *rule)
++{
++    const int pos = RulePosition(rule->name);
++    if (pos >= 0 && size_t(pos) < run.rules.size())
++        return run.rules[pos].text;
++    return ConfLine(rule->cfgline);
++}
++
++/*
++########
++# FormatTrace -> std::string (규칙별 평가 과정 여러 줄)
++# 직전 fastCheck()의 Steps를 규칙 단위로 묶는다. 트리 직속 Step이 나올 때까지 모은 하위 Step 중
++# 그 규칙의 직속 자식만 "이름=yes/no/?"로 붙인다(?: 오프라인에서 확정 불가). any-of/all-of 내부는 생략한다.
++# 규칙 줄은 RuleText()로 전체를 보여 준다.
++########
++*/
++static std::string
++FormatTrace(const Acl::Tree *tree, const ConfigRun &run)
 +{
 +    std::ostringstream out;
 +    std::vector<const Step *> leaves;
@@ -456,17 +735,23 @@
 +            (step.result ? " MATCH " : " no    ");
 +        for (const auto *leaf : leaves) {
 +            if (leaf->parent != step.node)
-+                continue; // nested any-of/all-of/!acl internals
++                continue;
 +            out << " " << leaf->node->name << "=" <<
 +                (WasSkipped(leaf->node) ? "?" : (leaf->result ? "yes" : "no"));
 +        }
-+        out << "   [" << ConfLine(step.node->cfgline) << "]\n";
++        out << "   [" << RuleText(run, step.node) << "]\n";
 +        leaves.clear();
 +    }
 +    return out.str();
 +}
 +
-+/// every configured rule, from the parsed tree
++/*
++########
++# CollectRules -> std::vector<RuleInfo>
++# 파싱된 http_access 트리를 treeDump()로 덤프해 줄바꿈 토큰마다 규칙 하나를 만든다.
++# 두 번째 토큰이 동작, 그 뒤가 ACL 이름이며, 이름은 등장 순서대로 http_access#N.
++########
++*/
 +static std::vector<RuleInfo>
 +CollectRules(const Acl::Tree *tree)
 +{
@@ -496,8 +781,13 @@
 +    return result;
 +}
 +
-+/* evaluation */
-+
++/*
++########
++# CountDecision -> void (run의 집계 갱신)
++# 판정 종류별 수, UNSURE·DIFF 수, implicit 수를 센다. 판정 규칙의 decided를 올리고(AUTH로 끝난 경우처럼
++# matches에 없어도), 판정 규칙이 아닌 나머지 매칭 규칙의 shadowed를 올린다.
++########
++*/
 +static void
 +CountDecision(ConfigRun &run, const Decision &d)
 +{
@@ -514,7 +804,6 @@
 +    if (d.vsLog == "DIFF")
 +        ++run.differ;
 +
-+    // the deciding rule may have no match entry (e.g., it ended the check with AUTH)
 +    const int decisive = d.rule == "implicit" ? -1 : RulePosition(d.rule);
 +    if (d.rule == "implicit")
 +        ++run.implicitHits;
@@ -528,7 +817,21 @@
 +    }
 +}
 +
-+/// replays one record through the current http_access rules
++/*
++########
++# Evaluate -> Decision
++# 로그 한 줄을 현재 http_access로 판정한다.
++# 1. URL과 메서드로 HttpRequest를 만들고 %>a, %la, --sim-port, 그 포트의 myportname, HTTP 버전을 넣는다.
++# AccessLogEntry를 붙이고, 로그 시각이 있으면 그 오프셋으로 TZ를 맞춘다. 목적지 "호스트:포트"를 판정에 기록한다.
++# 2. 패스 0은 실제 판정이다. 패스 k는 SkipRulesThrough를 직전 승자의 위치로 두고 다시 fastCheck()해서
++# 다음으로 매칭되는 규칙을 찾는다. 매칭이 없으면 멈춘다. AUTH·DUNNO로 끝나면 그 규칙을 예외 응답과 함께
++# 사슬에 넣고 멈춘다(Squid도 거기서 검사를 끝낸다).
++# debugs()가 시계를 현재로 되돌리므로 매 패스 직전에 squid_curtime 등을 로그 시각으로 다시 넣는다.
++# 3. 패스 0의 Skipped가 UNSURE가 된다. AUTH/DUNNO면 그 판정을 낸 ACL을, 로그 시각이 없으면 평가된 time ACL을 더한다.
++# 4. 판정 규칙(또는 implicit)을 정하고, 현재 설정이면 로그의 %Ss와 비교한다.
++# 5. 평가 과정은 --sim-trace면 전부, 리포트면 (클라이언트, 메서드, 목적지, 판정, 규칙) 묶음마다 하나만 보관한다.
++########
++*/
 +static Decision
 +Evaluate(Record &r, ConfigRun &run, const bool current, const int localPort)
 +{
@@ -548,7 +851,7 @@
 +        d.ruleText = "unparsable URL";
 +        return d;
 +    }
-+    r.host = std::string(request->url.host()) + ":" + std::to_string(request->url.port());
++    d.host = std::string(request->url.host()) + ":" + std::to_string(request->url.port());
 +
 +    unsigned vMajor = 1, vMinor = 1;
 +    if (sscanf(r.version.c_str(), "%u.%u", &vMajor, &vMinor) == 2)
@@ -562,7 +865,6 @@
 +    if (!(request->my_addr = r.localIp.c_str()))
 +        request->my_addr.setAnyAddr();
 +    request->my_addr.port(localPort);
-+    // myportname: the http_port listening on localPort, else the first one
 +    const AnyP::PortCfg *listener = HttpPortList.getRaw();
 +    for (const AnyP::PortCfg *p = listener; p; p = p->next.getRaw()) {
 +        if (p->s.port() == localPort) {
@@ -573,12 +875,12 @@
 +    if (listener && listener->name)
 +        request->myportname = listener->name;
 +    if (DnsMode == 2)
-+        request->flags.destinationIpLookedUp = true; // lookups here are final
++        request->flags.destinationIpLookedUp = true;
 +
 +    AccessLogEntry::Pointer al = new AccessLogEntry;
 +    al->request = request.getRaw();
 +    HTTPMSGLOCK(al->request);
-+    al->adapted_request = request.getRaw(); // no adaptation offline
++    al->adapted_request = request.getRaw();
 +    HTTPMSGLOCK(al->adapted_request);
 +    al->url = SBuf(r.url.c_str());
 +    al->cache.caddr = request->client_addr;
@@ -586,14 +888,12 @@
 +    if (r.hasTime)
 +        UseLogTimezone(r.tzOffset);
 +
-+    // Pass 0 is the real check. Each later pass ignores all rules up to the
-+    // previous winner, revealing the next matching rule, until none is left.
 +    Skipped.clear();
 +    allow_t firstAnswer;
 +    const ACL *lastEvaluated = nullptr;
 +    bool firstPassMatched = false;
 +    std::string trace;
-+    std::set<std::string> unsure; // only pass 0 decides the verdict
++    std::set<std::string> unsure;
 +    ACLChecklist::SkipRulesThrough = -1;
 +    for (size_t pass = 0; pass <= run.rules.size(); ++pass) {
 +        Steps.clear();
@@ -603,8 +903,6 @@
 +            checklist.markDestinationDomainChecked();
 +            checklist.markSourceDomainChecked();
 +        }
-+        // every logged debug message resets the clock (getCurrentTime()),
-+        // so restore the logged time right before "acl time" may read it
 +        if (r.hasTime) {
 +            squid_curtime = r.when;
 +            current_time.tv_sec = r.when;
@@ -614,21 +912,28 @@
 +        const allow_t answer = checklist.fastCheck();
 +
 +        const ACL *winner = nullptr;
++        const ACL *lastRule = nullptr;
 +        for (const auto &step : Steps) {
 +            if (step.parent != tree)
 +                continue;
-+            if (pass == 0)
-+                lastEvaluated = step.node;
++            lastRule = step.node;
 +            if (step.result)
 +                winner = step.node;
 +        }
++        const bool exceptional = !answer.allowed() && !answer.denied();
 +        if (pass == 0) {
++            lastEvaluated = lastRule;
 +            firstAnswer = answer;
 +            firstPassMatched = winner;
-+            trace = FormatTrace(tree);
++            trace = FormatTrace(tree, run);
 +            unsure = Skipped;
-+            if (!answer.allowed() && !answer.denied()) {
-+                // AUTH or DUNNO: the last ACL checked in that rule ended the check
++            if (!r.hasTime) {
++                for (const auto &step : Steps) {
++                    if (strcmp(step.node->typeString(), "time") == 0)
++                        unsure.insert(step.node->name);
++                }
++            }
++            if (exceptional) {
 +                const ACL *culprit = lastEvaluated;
 +                for (const auto &step : Steps) {
 +                    if (lastEvaluated && step.parent == lastEvaluated)
@@ -637,16 +942,18 @@
 +                unsure.insert(culprit ? culprit->name : "?");
 +            }
 +        }
++        if (!winner && exceptional && lastRule)
++            winner = lastRule;
 +        if (!winner)
 +            break;
 +
 +        RuleMatch m;
 +        m.name = winner->name;
-+        m.action = answer.allowed() ? "allow" : (answer.denied() ? "deny" : "?");
-+        m.text = ConfLine(winner->cfgline);
++        m.action = exceptional ? Lower(VerdictName(answer)) : (answer.allowed() ? "allow" : "deny");
++        m.text = RuleText(run, winner);
 +        d.matches.push_back(m);
-+        if (m.action == "?")
-+            break; // exceptional answers (e.g., AUTH) end the check
++        if (exceptional)
++            break;
 +
 +        ACLChecklist::SkipRulesThrough = RulePosition(m.name);
 +        if (ACLChecklist::SkipRulesThrough < 0)
@@ -655,13 +962,9 @@
 +    ACLChecklist::SkipRulesThrough = -1;
 +
 +    d.verdict = VerdictName(firstAnswer);
-+    if (firstPassMatched) {
++    if (firstPassMatched || (!firstAnswer.allowed() && !firstAnswer.denied() && !d.matches.empty())) {
 +        d.rule = d.matches[0].name;
 +        d.ruleText = d.matches[0].text;
-+    } else if (!firstAnswer.allowed() && !firstAnswer.denied() && lastEvaluated) {
-+        // an exceptional answer while this rule was being checked
-+        d.rule = lastEvaluated->name;
-+        d.ruleText = ConfLine(lastEvaluated->cfgline);
 +    } else {
 +        d.rule = "implicit";
 +        d.ruleText = "(no rule matched: opposite of the last rule's action)";
@@ -678,8 +981,7 @@
 +            d.vsLog = d.verdict == logged ? "same" : "DIFF";
 +    }
 +
-+    // keep one trace per report group; all of them for --sim-trace
-+    const std::string key = r.clientIp + "\x1f" + r.method + "\x1f" + r.host + "\x1f" + d.verdict + "\x1f" + d.rule;
++    const std::string key = r.clientIp + "\x1f" + r.method + "\x1f" + d.host + "\x1f" + d.verdict + "\x1f" + d.rule;
 +    const bool firstOfGroup = run.traceAt.find(key) == run.traceAt.end();
 +    if (ShowTrace || (ReportFile && firstOfGroup))
 +        d.trace = trace;
@@ -688,8 +990,13 @@
 +    return d;
 +}
 +
-+/* --optimize */
-+
++/*
++########
++# AddFinding -> void (run.findings에 추가)
++# Finding을 만들어 넣는다. 파서가 같은 문제를 두 번 알릴 수 있으므로(splay 트리 재비교 등)
++# 항목·대상·위치·설명이 모두 같은 것이 이미 있으면 넣지 않는다.
++########
++*/
 +static void
 +AddFinding(ConfigRun &run, const int severity, const char *category, const std::string &subject,
 +           const std::string &where, const std::string &message, const std::string &fix)
@@ -701,7 +1008,6 @@
 +    f.where = where;
 +    f.message = message;
 +    f.fix = fix;
-+    // a parser may report the same problem twice (e.g., splay tree re-comparisons)
 +    for (const auto &old : run.findings) {
 +        if (old.category == f.category && old.subject == f.subject && old.where == f.where && old.message == f.message)
 +            return;
@@ -709,6 +1015,12 @@
 +    run.findings.push_back(f);
 +}
 +
++/*
++########
++# JoinDump -> std::string (값을 공백으로 이은 문자열)
++# ACL의 dump() 값을 공백으로 잇는다. 같은 타입·옵션·값의 ACL을 찾는 서명에 쓴다.
++########
++*/
 +static std::string
 +JoinDump(const ACL *acl)
 +{
@@ -721,18 +1033,23 @@
 +    return values;
 +}
 +
-+/// names of ACLs that match every request
++/*
++########
++# UniversalAcls -> std::set<std::string> (ACL 이름)
++# 모든 요청에 매칭되는 ACL: all, 모든 값에 매칭되는 url_regex(.*, ., ^), 값에 all, 0.0.0.0/0, ::/0이 있는 src.
++# urlpath_regex는 경로가 없는 요청(CONNECT)에 매칭되지 않고, dst all은 DNS 응답이 있어야 매칭되므로 넣지 않는다.
++# 다른 정규식 타입(browser 등)은 필드가 없으면 불일치하므로 넣지 않는다.
++########
++*/
 +static std::set<std::string>
 +UniversalAcls()
 +{
 +    std::set<std::string> names;
 +    names.insert("all");
-+    // other regex types (browser, req_header, ...) mismatch when their field is absent
 +    for (const auto &note : Acl::ConfigNotes) {
-+        if (note.kind == "universal" && (note.type == "url_regex" || note.type == "urlpath_regex"))
++        if (note.kind == "universal" && note.type == "url_regex")
 +            names.insert(note.acl);
 +    }
-+    // "dst all" still needs a DNS answer, so only "src" is universal
 +    static const std::set<std::string> anyAddress = { "all", "0.0.0.0/0", "::/0", "[::]/0" };
 +    for (const ACL *a = Config.aclList; a; a = a->next) {
 +        if (strcmp(a->typeString(), "src") != 0)
@@ -745,21 +1062,44 @@
 +    return names;
 +}
 +
-+/* comparing the values of different ACLs */
++/*
++########
++# Wide -> typedef std::pair<uint64_t, uint64_t>
++# 128비트 값(상위, 하위). IPv6 주소, IPv4는 ::ffff:a.b.c.d로 매핑한 주소, 포트 번호를 같은 방식으로 담는다.
++########
++*/
++typedef std::pair<uint64_t, uint64_t> Wide;
 +
-+typedef std::pair<uint64_t, uint64_t> Wide; ///< an IPv6 address (IPv4 as ::ffff:a.b.c.d) or a number
-+typedef std::pair<Wide, Wide> WideRange; ///< inclusive
++/*
++########
++# WideRange -> typedef std::pair<Wide, Wide>
++# 양 끝을 포함하는 범위 [first, second].
++########
++*/
++typedef std::pair<Wide, Wide> WideRange;
 +
-+/// what one ACL matches, comparable with another ACL of the same kind
++/*
++########
++# AclValues -> 클래스: 값으로 비교할 수 있는 ACL 하나의 값
++# kind: ACL 타입(비교할 수 없으면 빈 문자열). ranges: 정렬·병합된 주소 또는 포트 범위.
++# domains: dstdomain 값(".example.com"은 example.com과 하위 도메인 전체). words: 메서드, 프로토콜, 포트 이름.
++########
++*/
 +class AclValues
 +{
 +public:
-+    std::string kind; ///< ACL type; empty when the values cannot be compared
-+    std::vector<WideRange> ranges; ///< sorted, merged addresses or ports
-+    std::set<std::string> domains; ///< ".example.com" also matches example.com and its subdomains
-+    std::set<std::string> words; ///< methods, protocols, port names
++    std::string kind;
++    std::vector<WideRange> ranges;
++    std::set<std::string> domains;
++    std::set<std::string> words;
 +};
 +
++/*
++########
++# ParseWideAddress -> bool (out, v4 설정)
++# IPv4 또는 IPv6 주소 문자열(대괄호 허용)을 inet_pton()으로 읽어 128비트 값으로 만든다. IPv4는 ::ffff: 매핑.
++########
++*/
 +static bool
 +ParseWideAddress(std::string text, Wide &out, bool &v4)
 +{
@@ -787,7 +1127,14 @@
 +    return true;
 +}
 +
-+/// parses an IP ACL value as dumped: all, addr, addr-addr, with an optional /prefix
++/*
++########
++# ParseIpValue -> bool (range 설정)
++# squid가 덤프한 IP ACL 값 하나를 범위로 바꾼다: all, 주소, 주소-주소, 그리고 선택적인 /접두어 길이.
++# IPv4 접두어는 매핑 공간에 맞게 96을 더하고, 접두어 밖의 호스트 비트를 시작은 0, 끝은 1로 채운다.
++# 64비트 반쪽마다 따로 계산해 64 이상 시프트를 피한다. 읽을 수 없거나 끝이 시작보다 작으면 false.
++########
++*/
 +static bool
 +ParseIpValue(const std::string &item, WideRange &range)
 +{
@@ -815,7 +1162,6 @@
 +            prefix += 96;
 +        if (prefix > 128)
 +            return false;
-+        // host bits of each 64-bit half
 +        const auto hostBits = [](const int p, const int from) -> uint64_t {
 +            if (p <= from)
 +                return ~uint64_t(0);
@@ -832,6 +1178,12 @@
 +    return !(range.second < range.first);
 +}
 +
++/*
++########
++# ParsePortValue -> bool (range 설정)
++# "80"이나 "1025-65535"를 범위로 바꾼다. 숫자와 '-' 외의 문자가 있으면 false.
++########
++*/
 +static bool
 +ParsePortValue(const std::string &item, WideRange &range)
 +{
@@ -843,6 +1195,12 @@
 +    return !(range.second < range.first);
 +}
 +
++/*
++########
++# WideText -> std::string
++# 128비트 값을 사람이 읽는 형태로: 포트 타입이면 숫자, ::ffff: 매핑이면 IPv4, 나머지는 IPv6 표기.
++########
++*/
 +static std::string
 +WideText(const Wide &w, const std::string &kind)
 +{
@@ -859,6 +1217,12 @@
 +    return inet_ntop(AF_INET6, b, buf, sizeof(buf)) ? buf : "?";
 +}
 +
++/*
++########
++# RangeText -> std::string
++# 범위를 "a", "a/접두어"(정렬된 블록일 때), 또는 "a-b"로 쓴다.
++########
++*/
 +static std::string
 +RangeText(const WideRange &r, const std::string &kind)
 +{
@@ -866,7 +1230,6 @@
 +    if (r.first == r.second)
 +        return first;
 +    if (kind != "port" && kind != "localport") {
-+        // an aligned block reads better as addr/prefix
 +        const bool v4 = r.first.first == 0 && (r.first.second >> 32) == 0xffff;
 +        for (int prefix = v4 ? 96 : 0; prefix < 128; ++prefix) {
 +            const uint64_t hi = prefix >= 64 ? 0 : ~uint64_t(0) >> prefix;
@@ -879,7 +1242,14 @@
 +    return first + "-" + WideText(r.second, kind);
 +}
 +
-+/// the values of an ACL whose type we can compare, as squid itself dumps them
++/*
++########
++# ValuesOf -> AclValues (비교할 수 없으면 kind가 빈 값)
++# src/dst/localip, port/localport, dstdomain/srcdomain, method/proto/myportname ACL의 dump() 값을 읽는다.
++# 값 하나라도 읽지 못하면 추측하지 않고 비교 대상에서 뺀다. 도메인은 소문자로, method/proto는 대문자로 맞춘다.
++# 범위는 정렬한 뒤 겹치거나 맞닿은 것을 합친다(최댓값에서 +1 넘침은 따로 처리).
++########
++*/
 +static AclValues
 +ValuesOf(const ACL *acl)
 +{
@@ -897,7 +1267,7 @@
 +        WideRange range;
 +        if (ipTypes.count(type) || portTypes.count(type)) {
 +            if (!(ipTypes.count(type) ? ParseIpValue(item, range) : ParsePortValue(item, range)))
-+                return AclValues(); // a value we do not understand: do not guess
++                return AclValues();
 +            ranges.push_back(range);
 +        } else if (domainTypes.count(type)) {
 +            v.domains.insert(Lower(item));
@@ -912,7 +1282,7 @@
 +            if (++next.second == 0)
 +                ++next.first;
 +            const bool atEnd = v.ranges.back().second == Wide(~uint64_t(0), ~uint64_t(0));
-+            if (atEnd || !(next < r.first)) { // overlapping or adjacent
++            if (atEnd || !(next < r.first)) {
 +                if (v.ranges.back().second < r.second)
 +                    v.ranges.back().second = r.second;
 +                continue;
@@ -925,7 +1295,13 @@
 +    return v;
 +}
 +
-+/// whether dstdomain value 'narrow' is matched by the value 'wide' in 'domains'
++/*
++########
++# DomainCovered -> bool
++# dstdomain 값 narrow가 domains 중 하나에 매칭되는지. 같은 값, "."+narrow,
++# 그리고 narrow의 각 점 위치에서 시작하는 접미사(".example.com")를 집합에서 찾는다. 값 길이만큼만 조회한다.
++########
++*/
 +static bool
 +DomainCovered(const std::set<std::string> &domains, const std::string &narrow)
 +{
@@ -940,14 +1316,19 @@
 +    return false;
 +}
 +
-+/// whether every request matching b also matches a
++/*
++########
++# Covers -> bool
++# b에 매칭되는 모든 요청이 a에도 매칭되는지(같은 타입일 때만). b의 범위마다 a의 병합된 범위 하나 안에
++# 들어가는지 이분 탐색하고, 도메인은 DomainCovered(), 단어는 집합 포함으로 본다.
++########
++*/
 +static bool
 +Covers(const AclValues &a, const AclValues &b)
 +{
 +    if (a.kind.empty() || a.kind != b.kind)
 +        return false;
 +    for (const auto &r : b.ranges) {
-+        // merged ranges: a contiguous range in their union lies within one of them
 +        auto it = std::upper_bound(a.ranges.begin(), a.ranges.end(), WideRange(r.first, Wide(~uint64_t(0), ~uint64_t(0))));
 +        if (it == a.ranges.begin() || (--it)->second < r.second)
 +            return false;
@@ -963,35 +1344,57 @@
 +    return true;
 +}
 +
-+/// values matched by both a and b (empty when they cannot overlap)
++/*
++########
++# Shared -> std::vector<std::string> (공통 값, 최대 limit개)
++# a와 b 둘 다에 매칭되는 값. 범위는 두 병합 목록을 한 번씩 훑어 교집합을 만들고,
++# 도메인은 한쪽 값이 다른 쪽에 매칭되는 것, 단어는 교집합이다. limit개를 채우면 멈춘다(겹침 여부만 볼 때 1).
++########
++*/
 +static std::vector<std::string>
-+Shared(const AclValues &a, const AclValues &b)
++Shared(const AclValues &a, const AclValues &b, const size_t limit = SIZE_MAX)
 +{
 +    std::vector<std::string> shared;
 +    if (a.kind.empty() || a.kind != b.kind)
 +        return shared;
-+    for (const auto &x : a.ranges) {
-+        for (const auto &y : b.ranges) {
-+            const Wide first = std::max(x.first, y.first), last = std::min(x.second, y.second);
-+            if (!(last < first))
-+                shared.push_back(RangeText(WideRange(first, last), a.kind));
-+        }
++    auto x = a.ranges.begin(), y = b.ranges.begin();
++    while (x != a.ranges.end() && y != b.ranges.end() && shared.size() < limit) {
++        const Wide first = std::max(x->first, y->first), last = std::min(x->second, y->second);
++        if (!(last < first))
++            shared.push_back(RangeText(WideRange(first, last), a.kind));
++        if (x->second < y->second)
++            ++x;
++        else
++            ++y;
 +    }
++    std::set<std::string> seen;
 +    for (const auto &d : b.domains) {
-+        if (DomainCovered(a.domains, d))
++        if (shared.size() >= limit)
++            break;
++        if (DomainCovered(a.domains, d) && seen.insert(d).second)
 +            shared.push_back(d);
 +    }
 +    for (const auto &d : a.domains) {
-+        if (DomainCovered(b.domains, d) && std::find(shared.begin(), shared.end(), d) == shared.end())
++        if (shared.size() >= limit)
++            break;
++        if (DomainCovered(b.domains, d) && seen.insert(d).second)
 +            shared.push_back(d);
 +    }
 +    for (const auto &w : a.words) {
++        if (shared.size() >= limit)
++            break;
 +        if (b.words.count(w))
 +            shared.push_back(w);
 +    }
 +    return shared;
 +}
 +
++/*
++########
++# FirstValues -> std::string ("a, b, c, ... (N in all)")
++# 값 목록의 처음 limit개와 전체 개수를 출력용으로 잇는다.
++########
++*/
 +static std::string
 +FirstValues(const std::vector<std::string> &values, const size_t limit = 3)
 +{
@@ -1003,9 +1406,42 @@
 +    return text;
 +}
 +
-+typedef std::map<std::string, AclValues> AclValueMap; ///< by lower-case ACL name
++/*
++########
++# HasIpLiteral -> bool
++# dstdomain 값 중 IP 주소가 있는지. dstdomain은 URL 호스트가 IP면 역방향 DNS 이름으로도 비교하므로,
++# IP 값이 있으면 공통 값이 없다는 것만으로 두 ACL이 동시에 매칭되지 않는다고 할 수 없다.
++########
++*/
++static bool
++HasIpLiteral(const AclValues &v)
++{
++    for (const auto &d : v.domains) {
++        Wide w;
++        bool v4 = false;
++        if (ParseWideAddress(d, w, v4))
++            return true;
++    }
++    return false;
++}
 +
-+/// whether a request matching rule condition 'narrow' ("name" or "!name") always matches 'wide'
++/*
++########
++# AclValueMap -> typedef std::map<std::string, AclValues>
++# 소문자 ACL 이름 -> 그 ACL의 값.
++########
++*/
++typedef std::map<std::string, AclValues> AclValueMap;
++
++/*
++########
++# Implies -> bool (why에 근거 설정)
++# 규칙 조건 narrow("이름" 또는 "!이름")가 맞으면 wide도 반드시 맞는지.
++# 같은 조건이면 참. B가 A 안에 있으면 B -> A. A가 B 안에 있으면 !B -> !A.
++# A와 B에 공통 값이 없으면 B -> !A. 단, 한 요청이 둘 다에 매칭될 수 있는 경우는 제외한다:
++# dst, srcdomain(DNS 응답이 여럿), IP 값이 있는 dstdomain(IP 호스트는 역방향 이름으로도 비교).
++########
++*/
 +static bool
 +Implies(const std::string &narrow, const std::string &wide, const AclValueMap &values, std::string &why)
 +{
@@ -1025,16 +1461,22 @@
 +        why = "'" + w + "' is inside '" + n + "'";
 +        return true;
 +    }
-+    // dst and srcdomain match when any of several DNS answers matches, so disjoint lists prove nothing
 +    if (!narrowNot && wideNot && nv->second.kind == wv->second.kind && nv->second.kind != "dst" &&
-+            nv->second.kind != "srcdomain" && Shared(nv->second, wv->second).empty()) {
++            nv->second.kind != "srcdomain" && !HasIpLiteral(nv->second) && !HasIpLiteral(wv->second) &&
++            Shared(nv->second, wv->second, 1).empty()) {
 +        why = "'" + n + "' has no value in common with '" + w + "'";
 +        return true;
 +    }
 +    return false;
 +}
 +
-+/// whether every request matching rule j's conditions also matches rule i's; explains the ACL inclusions used
++/*
++########
++# RuleCovers -> bool (why에 근거 목록 설정)
++# later 규칙에 매칭되는 모든 요청이 earlier 규칙에도 매칭되는지. earlier의 조건 하나하나에 대해
++# later 조건 중 그것을 보장하는(Implies) 것이 있어야 한다. earlier에 조건이 없으면 항상 참.
++########
++*/
 +static bool
 +RuleCovers(const std::set<std::string> &earlier, const std::set<std::string> &later, const AclValueMap &values,
 +           std::string &why)
@@ -1057,11 +1499,25 @@
 +    return true;
 +}
 +
-+/// finds unneeded or ineffective ACLs and http_access rules in the parsed squid.conf
++/*
++########
++# Analyze -> void (run.findings 채움)
++# 1. 파서 노트: 내장 ACL 재정의, 넓은 값에 포함된 값, 중복 값, 모든 값에 매칭되는 정규식(7.7은 병합된 범위도).
++# 2. ACL: 참조되지 않는 ACL, 타입·옵션·값이 같은 ACL. ValuesOf()로 같은 타입끼리 비교해
++# 표기만 다른 동일 ACL, 일부 값을 공유하는 ACL(공유 값 예시), 다른 ACL 안에 들어가는 ACL(INFO,
++# 한 ACL 안에 6개 이상이면 한 줄로 묶음)을 보고한다. 내장 ACL은 비교 대상에서 빼지만 값은 규칙 판단에 쓴다.
++# 3. 규칙: 반복된 ACL, X와 !X 동시 요구, !all, 다른 조건과 함께 쓴 all. all류를 뺀 조건 집합을 만든다.
++# 4. 앞 규칙이 RuleCovers()로 뒤 규칙을 덮으면 같은 동작은 중복, 반대 동작은 도달 불가. 판단에 쓴 ACL 포함 관계를
++# 메시지에 붙인다. 그 규칙이 마지막이라 기본 판정을 정하고 있으면 지우라고 하지 않고 심각도를 낮춘다.
++# urlpath_regex의 '모든 값'은 경로가 있는 요청만이라는 점을 메시지에 덧붙인다.
++# 5. 반대 동작의 앞 규칙의 모든 ACL이 이 규칙의 같은 타입 ACL과 값을 공유하면 일부 가려진 규칙(LOW).
++# 6. 로그를 재생했다면 어떤 요청에도 매칭되지 않은 규칙, 매칭은 됐지만 판정한 적이 없는 규칙.
++# 마지막에 심각도 순으로 안정 정렬한다.
++########
++*/
 +static void
 +Analyze(ConfigRun &run)
 +{
-+    // what the ACL parsers noticed
 +    for (const auto &note : Acl::ConfigNotes) {
 +        if (note.kind == "predefined")
 +            AddFinding(run, 2, "built-in ACL redefined", note.acl, note.where + "  " + ConfLine(note.line.c_str()), note.message,
@@ -1073,11 +1529,11 @@
 +            AddFinding(run, 1, "duplicate entry", note.acl, note.where + "  " + ConfLine(note.line.c_str()), note.message,
 +                       "delete the repeated entry");
 +        else if (note.kind == "universal")
-+            AddFinding(run, 2, "matches everything", note.acl, note.where + "  " + ConfLine(note.line.c_str()), note.message,
++            AddFinding(run, 2, "matches everything", note.acl, note.where + "  " + ConfLine(note.line.c_str()),
++                       note.message + (note.type == "urlpath_regex" ? " that has a path (CONNECT requests have none)" : ""),
 +                       "use the built-in 'all' ACL or remove the pattern");
 +    }
 +
-+    // unused and identical ACL definitions
 +    std::map<std::string, std::vector<std::string> > bySignature;
 +    for (ACL *a = Config.aclList; a; a = a->next) {
 +        if (Acl::PredefinedAcls.count(a->name))
@@ -1105,7 +1561,6 @@
 +                   "these ACLs have the same type and values", "keep one of them and use its name everywhere");
 +    }
 +
-+    // different ACLs of one type whose values include or overlap each other
 +    AclValueMap values;
 +    std::vector<const ACL *> comparable;
 +    for (const ACL *a = Config.aclList; a; a = a->next) {
@@ -1116,8 +1571,8 @@
 +        if (!Acl::PredefinedAcls.count(a->name))
 +            comparable.push_back(a);
 +    }
-+    std::map<const ACL *, std::vector<const ACL *> > inside; // wide ACL -> ACLs inside it
-+    std::vector<const ACL *> insideOrder; // wide ACLs, in the order found
++    std::map<const ACL *, std::vector<const ACL *> > inside;
++    std::vector<const ACL *> insideOrder;
 +    for (size_t i = 0; i < comparable.size(); ++i) {
 +        for (size_t j = i + 1; j < comparable.size(); ++j) {
 +            const ACL *a = comparable[i], *b = comparable[j];
@@ -1165,7 +1620,6 @@
 +                   insideFix);
 +    }
 +
-+    // http_access rules
 +    const std::set<std::string> universal = UniversalAcls();
 +    const size_t count = run.rules.size();
 +    std::vector<std::set<std::string> > conditions(count);
@@ -1195,16 +1649,13 @@
 +                               "'" + base + "' matches everything, so it adds no condition",
 +                               "remove it, unless it is last on purpose to suppress an authentication challenge");
 +                }
-+                continue; // a universal ACL does not narrow the rule
++                continue;
 +            }
 +            conditions[j].insert(acl);
 +        }
 +    }
 +
-+    // a rule is dead when every request it matches also matches an earlier rule: the earlier rule's ACLs
-+    // are a subset of its ACLs, or are implied by them through the ACL values (www.example.com is inside
-+    // .example.com; port 9000 is outside Safe_ports, so it matches !Safe_ports)
-+    bool unconditionalBefore = false; // an earlier rule matches every request
++    bool unconditionalBefore = false;
 +    for (size_t j = 0; j < count; ++j) {
 +        if (impossible[j])
 +            continue;
@@ -1218,7 +1669,6 @@
 +                why = " (" + why + ")";
 +            const RuleInfo &earlier = run.rules[i];
 +            reported[j] = true;
-+            // the implicit default matters only if some request can reach it
 +            const bool setsDefault = j + 1 == count && !unconditionalBefore &&
 +                                     ImplicitVerdict(run, rule.name) != ImplicitVerdict(run);
 +            if (earlier.action == rule.action && setsDefault)
@@ -1230,6 +1680,13 @@
 +                AddFinding(run, 2, "redundant rule", rule.name, rule.text,
 +                           "every request it matches is already matched by " + earlier.name + " [" + earlier.text +
 +                           "] with the same action" + why, "delete this rule");
++            else if (setsDefault)
++                AddFinding(run, 2, "unreachable rule", rule.name, rule.text,
++                           "every request it matches is decided first by " + earlier.name + " [" + earlier.text +
++                           "] with the opposite action" + why,
++                           "move it above " + earlier.name + ", or replace it with 'http_access " +
++                           (rule.action == "allow" ? "deny" : "allow") +
++                           " all': as the last rule it still makes unmatched requests " + ImplicitVerdict(run));
 +            else
 +                AddFinding(run, 3, "unreachable rule", rule.name, rule.text,
 +                           "every request it matches is decided first by " + earlier.name + " [" + earlier.text +
@@ -1239,8 +1696,6 @@
 +        unconditionalBefore = unconditionalBefore || unconditional;
 +    }
 +
-+    // a rule partly taken by an earlier rule with the opposite action: each of the earlier rule's ACLs
-+    // shares values with an ACL of the same type in this rule
 +    for (size_t j = 0; j < count; ++j) {
 +        if (impossible[j] || reported[j])
 +            continue;
@@ -1258,7 +1713,7 @@
 +                    const auto wv = values.find(Lower(wide)), nv = values.find(Lower(narrow));
 +                    if (wv == values.end() || nv == values.end())
 +                        continue;
-+                    const std::vector<std::string> both = Shared(wv->second, nv->second);
++                    const std::vector<std::string> both = Shared(wv->second, nv->second, 2);
 +                    if (!both.empty()) {
 +                        found = "'" + wide + "' and '" + narrow + "' share " + FirstValues(both, 2);
 +                        break;
@@ -1280,7 +1735,6 @@
 +        }
 +    }
 +
-+    // what the replayed log shows
 +    if (LogFile && !Records.empty()) {
 +        for (size_t j = 0; j < count; ++j) {
 +            if (impossible[j] || reported[j])
@@ -1303,14 +1757,24 @@
 +    });
 +}
 +
++/*
++########
++# SeverityName -> const char * (HIGH, MEDIUM, LOW, INFO)
++# Finding.severity 3, 2, 1, 0을 이름으로 바꾼다.
++########
++*/
 +static const char *
 +SeverityName(const int severity)
 +{
 +    return severity >= 3 ? "HIGH" : (severity == 2 ? "MEDIUM" : (severity == 1 ? "LOW" : "INFO"));
 +}
 +
-+/* terminal output */
-+
++/*
++########
++# PrintFindings -> void (표준 출력)
++# --optimize 결과를 심각도(색), 항목, 대상, 설명, 위치, 권장 조치 순으로 출력한다.
++########
++*/
 +static void
 +PrintFindings(const char *label, const ConfigRun &run)
 +{
@@ -1326,6 +1790,13 @@
 +    }
 +}
 +
++/*
++########
++# PrintDecision -> void (표준 출력)
++# 요청 한 줄의 결과: 줄 번호, 판정, 판정 규칙, 클라이언트, 메서드, URL, 로그와의 비교.
++# 이어서 판정 규칙 줄, 매칭 규칙 사슬과 판정 규칙이 없었다면의 결과, 확정 불가 ACL, --sim-trace면 평가 과정.
++########
++*/
 +static void
 +PrintDecision(const Record &r, const Decision &d, const ConfigRun &run)
 +{
@@ -1355,13 +1826,24 @@
 +        std::cout << d.trace;
 +}
 +
++/*
++########
++# Changed -> bool
++# 두 설정의 결과가 다른지. 규칙이 추가되면 번호가 밀리므로 번호가 아니라 판정과 규칙 줄 텍스트를 비교한다.
++########
++*/
 +static bool
 +Changed(const Decision &a, const Decision &b)
 +{
-+    // rule numbers shift when rules are added, so compare the rule text
 +    return a.verdict != b.verdict || a.ruleText != b.ruleText;
 +}
 +
++/*
++########
++# PrintChanges -> void (표준 출력)
++# --sim-compare에서 결과가 바뀐 요청마다 현재/새 판정, 판정 변경인지 규칙만 바뀐 것인지, 양쪽 규칙 줄을 출력한다.
++########
++*/
 +static void
 +PrintChanges()
 +{
@@ -1387,6 +1869,12 @@
 +    }
 +}
 +
++/*
++########
++# PrintRunSummary -> void (표준 출력)
++# 설정 하나의 집계(판정별 수, 확정 불가, 로그와 다름)와 규칙별 decided / also-matched 표, implicit 줄을 출력한다.
++########
++*/
 +static void
 +PrintRunSummary(const char *label, const ConfigRun &run, const bool current)
 +{
@@ -1407,6 +1895,12 @@
 +    std::cout << "# " << counts << "implicit " << ImplicitVerdict(run) << "\n";
 +}
 +
++/*
++########
++# PrintCompareSummary -> void (표준 출력)
++# 판정 변경 수, 규칙만 바뀐 수, 그리고 "현재 판정 규칙 -> 새 판정 규칙" 전환을 많은 순으로 출력한다.
++########
++*/
 +static void
 +PrintCompareSummary()
 +{
@@ -1433,8 +1927,12 @@
 +        std::cout << "# " << Pad(std::to_string(t.second), 9) << " " << t.first << "\n";
 +}
 +
-+/* HTML report */
-+
++/*
++########
++# Esc -> std::string
++# HTML에 넣을 문자열의 &, <, >, " 를 엔티티로 바꾼다.
++########
++*/
 +static std::string
 +Esc(const std::string &s)
 +{
@@ -1461,14 +1959,32 @@
 +    return out;
 +}
 +
++/*
++########
++# Pill -> std::string (HTML span)
++# 판정이나 심각도를 색 배지로 만든다. 클래스 이름은 소문자 값이다.
++########
++*/
 +static std::string
 +Pill(const std::string &verdict)
 +{
 +    return "<span class=\"pill " + Lower(verdict) + "\">" + Esc(verdict) + "</span>";
 +}
 +
++/*
++########
++# Counts -> typedef std::vector<std::pair<std::string, unsigned> >
++# (항목, 개수) 목록. Top()의 결과 형식이다.
++########
++*/
 +typedef std::vector<std::pair<std::string, unsigned> > Counts;
 +
++/*
++########
++# Top -> Counts
++# 개수 많은 순(같으면 이름 순)으로 정렬해 limit개만 남긴다.
++########
++*/
 +static Counts
 +Top(const std::map<std::string, unsigned> &counts, const size_t limit)
 +{
@@ -1481,6 +1997,12 @@
 +    return result;
 +}
 +
++/*
++########
++# ReportCard -> void (HTML 출력)
++# 요약 카드 하나(라벨, 값, 색 클래스)를 쓴다.
++########
++*/
 +static void
 +ReportCard(std::ostream &out, const char *label, const unsigned value, const char *cls)
 +{
@@ -1488,6 +2010,13 @@
 +        "</div><div class=\"value\">" << value << "</div></div>";
 +}
 +
++/*
++########
++# ReportRules -> void (HTML 출력)
++# 규칙 표: 번호, 동작, 규칙 줄, decided와 막대, also matched. 비교 모드면 다른 설정에 없는 규칙에 "only here",
++# 판정한 적 없는 규칙에 "never decides"를 붙이고, 마지막에 implicit 줄을 넣는다.
++########
++*/
 +static void
 +ReportRules(std::ostream &out, const ConfigRun &run, const std::set<std::string> &otherTexts, const bool compare)
 +{
@@ -1513,7 +2042,12 @@
 +        (100.0 * run.implicitHits / most) << "%\"></span></div></td><td class=\"num\">-</td></tr></tbody></table>";
 +}
 +
-+/// for every rule that denied something: what, who, and what would allow it
++/*
++########
++# ReportDenials -> void (HTML 출력)
++# 요청을 차단한 규칙마다(많은 순) 상위 목적지, 상위 클라이언트, 그 요청을 허용했을 다음 allow 규칙을 보여 준다.
++########
++*/
 +static void
 +ReportDenials(std::ostream &out, const ConfigRun &run)
 +{
@@ -1532,7 +2066,7 @@
 +        DenyInfo &info = byRule[d.rule];
 +        ++info.count;
 +        info.text = d.ruleText;
-+        ++info.hosts[Records[i].host];
++        ++info.hosts[HostOf(Records[i], d)];
 +        ++info.clients[Records[i].clientIp];
 +        const std::string allow = FirstMatching(d, "allow");
 +        ++info.alternatives[allow.empty() ? "no allow rule matches" : "allowed by " + allow];
@@ -1566,14 +2100,26 @@
 +    }
 +}
 +
++/*
++########
++# TraceOf -> std::string
++# 요청이 속한 묶음(클라이언트, 메서드, 목적지, 판정, 규칙)에 보관된 평가 과정을 찾는다.
++########
++*/
 +static std::string
 +TraceOf(const ConfigRun &run, const Record &r, const Decision &d)
 +{
-+    const auto it = run.traceAt.find(r.clientIp + "\x1f" + r.method + "\x1f" + r.host + "\x1f" + d.verdict + "\x1f" + d.rule);
++    const auto it = run.traceAt.find(r.clientIp + "\x1f" + r.method + "\x1f" + HostOf(r, d) + "\x1f" + d.verdict + "\x1f" + d.rule);
 +    return it == run.traceAt.end() ? std::string() : run.decisions[it->second].trace;
 +}
 +
-+/// distinct (client, method, destination, outcome) groups
++/*
++########
++# ReportRequests -> void (HTML 출력)
++# 요청을 (클라이언트, 메서드, 목적지, 결과[, 새 결과]) 묶음으로 세어 많은 순으로 표를 만든다.
++# 판정 규칙을 누르면 규칙 줄과 평가 과정이 펼쳐진다. 검색·판정 필터·"바뀐 것만" 체크박스를 넣고 ReportRowLimit에서 자른다.
++########
++*/
 +static void
 +ReportRequests(std::ostream &out, const bool compare)
 +{
@@ -1587,7 +2133,7 @@
 +    for (size_t i = 0; i < Records.size(); ++i) {
 +        const Record &r = Records[i];
 +        const Decision &a = Runs[0].decisions[i];
-+        std::string key = r.clientIp + "\x1f" + r.method + "\x1f" + r.host + "\x1f" + a.verdict + "\x1f" + a.rule;
++        std::string key = r.clientIp + "\x1f" + r.method + "\x1f" + HostOf(r, a) + "\x1f" + a.verdict + "\x1f" + a.rule;
 +        if (compare)
 +            key += "\x1f" + Runs[1].decisions[i].verdict + "\x1f" + Runs[1].decisions[i].rule;
 +        Group &g = groups[key];
@@ -1626,7 +2172,7 @@
 +        const bool changed = compare && Changed(a, Runs[1].decisions[g->first]);
 +        out << "<tr data-verdict=\"" << Esc(a.verdict) << "\" data-changed=\"" << (changed ? 1 : 0) << "\"" <<
 +            (changed ? " class=\"changed\"" : "") << "><td class=\"num\">" << g->count << "</td><td class=\"mono\">" <<
-+            Esc(r.clientIp) << "</td><td>" << Esc(r.method) << "</td><td class=\"mono\">" << Esc(r.host) <<
++            Esc(r.clientIp) << "</td><td>" << Esc(r.method) << "</td><td class=\"mono\">" << Esc(HostOf(r, a)) <<
 +            "</td><td>" << Pill(a.verdict) << "</td><td><details><summary>" << Esc(Short(a.rule)) <<
 +            "</summary><div class=\"mono small\">" << Esc(a.ruleText) << "</div><pre>" << Esc(TraceOf(Runs[0], r, a)) <<
 +            "</pre></details></td><td class=\"mono small\">" << Esc(MatchChain(a)) << "</td>";
@@ -1641,6 +2187,12 @@
 +    out << "</tbody></table>";
 +}
 +
++/*
++########
++# ReportTransitions -> void (HTML 출력)
++# --sim-compare에서 (현재 판정·규칙 -> 새 판정·규칙) 전환별 요청 수와 예시 요청을 보여 준다.
++########
++*/
 +static void
 +ReportTransitions(std::ostream &out)
 +{
@@ -1674,6 +2226,13 @@
 +    out << "</tbody></table>";
 +}
 +
++/*
++########
++# ReportLogDifferences -> void (HTML 출력)
++# 시뮬레이션 판정이 로그의 %Ss와 다른(DIFF) 요청을 (클라이언트, 목적지, 로그 결과, 판정, 규칙)별로 묶어 보여 주고,
++# http_access 밖의 지시어(miss_access, ssl_bump 등)나 그 뒤 바뀐 설정이 원인일 수 있음을 알린다.
++########
++*/
 +static void
 +ReportLogDifferences(std::ostream &out)
 +{
@@ -1684,7 +2243,7 @@
 +        if (d.vsLog != "DIFF")
 +            continue;
 +        const Record &r = Records[i];
-+        const std::string key = r.clientIp + "\x1f" + r.host + "\x1f" + r.squidStatus + "\x1f" + d.verdict + "\x1f" + d.rule;
++        const std::string key = r.clientIp + "\x1f" + HostOf(r, d) + "\x1f" + r.squidStatus + "\x1f" + d.verdict + "\x1f" + d.rule;
 +        if (!counts[key]++)
 +            example[key] = i;
 +    }
@@ -1701,13 +2260,19 @@
 +        const Record &r = Records[i];
 +        const Decision &d = Runs[0].decisions[i];
 +        out << "<tr><td class=\"num\">" << t.second << "</td><td class=\"mono\">" << Esc(r.clientIp) <<
-+            "</td><td class=\"mono\">" << Esc(r.host) << "</td><td class=\"mono\">" << Esc(r.squidStatus + "/" + r.status) <<
++            "</td><td class=\"mono\">" << Esc(HostOf(r, d)) << "</td><td class=\"mono\">" << Esc(r.squidStatus + "/" + r.status) <<
 +            "</td><td>" << Pill(d.verdict) << "</td><td class=\"mono small\"><b>" << Esc(Short(d.rule)) << "</b> " <<
 +            Esc(d.ruleText) << "</td></tr>";
 +    }
 +    out << "</tbody></table>";
 +}
 +
++/*
++########
++# ReportFindings -> void (HTML 출력)
++# --optimize 결과 표(심각도, 항목, 대상, 설명과 위치, 권장 조치)를 쓴다.
++########
++*/
 +static void
 +ReportFindings(std::ostream &out, const ConfigRun &run)
 +{
@@ -1727,6 +2292,13 @@
 +    out << "</tbody></table>";
 +}
 +
++/*
++########
++# WriteReport -> bool (쓰기 실패면 false)
++# 단일 HTML 리포트: 메타 정보, 요약 카드, 최적화 결과, 설정 비교 전환, 규칙 표, 규칙별 차단 요청,
++# 요청 묶음 표, 로그와 다른 요청, 필터용 스크립트. 라이트/다크 색 변수를 포함하고 외부 파일을 쓰지 않는다.
++########
++*/
 +static bool
 +WriteReport()
 +{
@@ -1891,8 +2463,13 @@
 +    return true;
 +}
 +
-+/* driver */
-+
++/*
++########
++# ReadLog -> bool (열지 못하면 false)
++# LogFile(또는 표준 입력)을 줄 단위로 읽어 Records에 넣는다. 끝의 \r을 지우고, 빈 줄과 #으로 시작하는 줄은
++# 건너뛰되 줄 번호는 센다. 파싱에 실패한 줄도 SKIP으로 보고하도록 넣는다.
++########
++*/
 +static bool
 +ReadLog()
 +{
@@ -1923,7 +2500,13 @@
 +    return true;
 +}
 +
-+/// replays all records through the currently parsed squid.conf
++/*
++########
++# RunConfig -> bool (http_access가 없으면 false)
++# 지금 파싱된 squid.conf로 Records 전부를 재생한다. hosts_file을 읽어 두고(--sim-dns off에서도 매칭되도록),
++# 연결 수가 없으므로 client_db를 끄고, 로컬 포트를 정한 뒤 요청마다 Evaluate(), CountDecision(), 필요하면 PrintDecision().
++########
++*/
 +static bool
 +RunConfig(ConfigRun &run, const bool current, const bool printEach)
 +{
@@ -1933,8 +2516,7 @@
 +        return false;
 +    }
 +
-+    parseEtcHosts(); // hosts_file entries resolve even with --sim-dns off
-+    // no live connections to count: "acl maxconn" never matches offline
++    parseEtcHosts();
 +    Config.onoff.client_db = 0;
 +    const int localPort = LocalPortOption >= 0 ? LocalPortOption :
 +                          (HttpPortList != nullptr ? HttpPortList->s.port() : CACHE_HTTP_PORT);
@@ -1950,7 +2532,16 @@
 +    return true;
 +}
 +
-+/// runs the simulation and/or the optimizer; returns the process exit code
++/*
++########
++# Run -> int (프로세스 종료 코드)
++# 시뮬레이터의 진입점. 로그를 읽고, DNS 모드를 정해 ipcache/fqdncache를 초기화하고, Tracer를 건다.
++# 현재 설정을 재생하고, --optimize면 다른 설정을 읽기 전에 Analyze()한다.
++# --sim-compare면 노트와 hosts_file 캐시 항목을 지우고(새 설정의 hosts_file만 쓰도록) 새 설정을 파싱해
++# 재생·분석하고 바뀐 요청을 출력한다.
++# Tracer를 떼고 요약, 최적화 결과, 리포트를 차례로 쓴다. 요청별 출력은 그것이 주 출력일 때만 한다.
++########
++*/
 +static int
 +Run()
 +{
@@ -1964,18 +2555,19 @@
 +    fqdncache_init();
 +    ACLChecklist::Tracer = &Trace;
 +
-+    // per-request lines only when they are the main output
 +    const bool printEach = LogFile && !CompareConf && (!ReportFile || ShowTrace);
 +
 +    Runs[0].path = ConfigFile;
 +    if (!RunConfig(Runs[0], true, printEach))
 +        return 1;
 +    if (Optimize)
-+        Analyze(Runs[0]); // before another squid.conf replaces the parsed one
++        Analyze(Runs[0]);
 +
 +    if (CompareConf) {
 +        Runs[1].path = CompareConf;
 +        Acl::ClearConfigNotes();
++        ipcache_restart();
++        fqdncache_restart();
 +        if (parseConfigFile(CompareConf) != 0) {
 +            std::cerr << "squid --simulate: errors in " << CompareConf << std::endl;
 +            return 1;
@@ -2010,43 +2602,36 @@
 +    return 0;
 +}
 +
-+} // namespace AclSimulator
++}
 +
-+#endif /* SQUID_ACLSIMULATOR_H */
-+
++#endif
 --- a/src/cache_cf.cc
 +++ b/src/cache_cf.cc
-@@ -592,7 +592,10 @@
+@@ -592,7 +592,8 @@
      if (!Config.chroot_dir) {
          leave_suid();
          setUmask(Config.umask);
 -        _db_init(Debug::cache_log, Debug::debugOptions);
-+        // squid --simulate/--optimize keeps logging to stderr: never append to
-+        // the cache_log of a squid that may be running with this configuration
 +        if (!opt_simulate)
 +            _db_init(Debug::cache_log, Debug::debugOptions);
          enter_suid();
      }
  
-@@ -3918,8 +3921,9 @@
-     if (stat(path, &sb) < 0) {
+@@ -3919,7 +3920,7 @@
          int xerrno = errno;
          debugs(0, DBG_CRITICAL, (opt_parse_cfg_only?"FATAL: ":"ERROR: ") << name << " " << path << ": " << xstrerr(xerrno));
--        // keep going to find more issues if we are only checking the config file with "-k parse"
+         // keep going to find more issues if we are only checking the config file with "-k parse"
 -        if (opt_parse_cfg_only)
-+        // keep going to find more issues if we are only checking the config file with "-k parse",
-+        // or replaying a log offline (squid --simulate/--optimize), which never opens these files
 +        if (opt_parse_cfg_only || opt_simulate)
              return;
          // this is fatal if it is found during startup or reconfigure
          if (opt_send_signal == -1 || opt_send_signal == SIGHUP)
 --- a/src/external_acl.cc
 +++ b/src/external_acl.cc
-@@ -646,6 +646,10 @@
+@@ -646,6 +646,9 @@
              return ACCESS_DUNNO;
          }
  
-+        // not initialized when squid --simulate replays a log without helpers
 +        if (!acl->def->cache || !acl->def->theHelper)
 +            return ACCESS_DUNNO;
 +
@@ -2092,25 +2677,31 @@
      if (flags & FQDN_LOOKUP_IF_MISS) {
          fqdncache_nbgethostbyaddr(addr, NULL, NULL);
      }
-@@ -680,6 +690,36 @@
+@@ -680,6 +690,42 @@
      fqdncacheLockEntry(fce);
  }
  
-+/// ACL simulator replacement for async rDNS: resolves synchronously (mode 2)
-+/// and caches the answer as a static entry, or gives up (mode 1)
++/*
++########
++# fqdncacheSimulatorLookup -> const char * (호스트 이름, 실패하면 NULL)
++# squid --simulate에서 비동기 역방향 DNS 대신 쓰는 조회. fqdncache_simulator_mode 2일 때만
++# getnameinfo()로 동기 조회해 결과를 hosts_file 항목처럼 고정 캐시에 넣고, 1이면 조회하지 않는다.
++# 실패한 주소는 기억해 다시 막히는 조회를 하지 않는다. 버퍼 1025바이트는 NI_MAXHOST다.
++########
++*/
 +static const char *
 +fqdncacheSimulatorLookup(const Ip::Address &addr, char *name)
 +{
 +    if (fqdncache_simulator_mode != 2)
 +        return NULL;
 +
-+    static std::set<std::string> failed; // do not repeat blocking lookups that failed
++    static std::set<std::string> failed;
 +    if (failed.count(name))
 +        return NULL;
 +
 +    struct addrinfo *ai = NULL;
 +    addr.getAddrInfo(ai);
-+    char host[1025]; // NI_MAXHOST
++    char host[1025];
 +    const int err = getnameinfo(ai->ai_addr, ai->ai_addrlen, host, sizeof(host), NULL, 0, NI_NAMEREQD);
 +    Ip::Address::FreeAddr(ai);
 +    if (err != 0) {
@@ -2131,11 +2722,16 @@
  fqdncacheRegisterWithCacheManager(void)
 --- a/src/fqdncache.h
 +++ b/src/fqdncache.h
-@@ -32,5 +32,8 @@
+@@ -32,5 +32,13 @@
  const char *fqdncache_gethostbyaddr(const Ip::Address &, int flags);
  void fqdncache_nbgethostbyaddr(const Ip::Address &, FQDNH *, void *);
  
-+/// offline ACL simulator rDNS behaviour; see ipcache_simulator_mode
++/*
++########
++# fqdncache_simulator_mode -> int
++# squid --simulate의 역방향 DNS 방식. 값은 ipcache_simulator_mode와 같다.
++########
++*/
 +extern int fqdncache_simulator_mode;
 +
  #endif /* SQUID_FQDNCACHE_H_ */
@@ -2184,19 +2780,25 @@
  
      if (flags & IP_LOOKUP_IF_MISS)
          ipcache_nbgethostbyname(name, NULL, NULL);
-@@ -1072,6 +1083,58 @@
+@@ -1072,6 +1083,64 @@
      return 0;
  }
  
-+/// ACL simulator replacement for async DNS: resolves synchronously (mode 2)
-+/// and caches the answer as a static entry, or gives up (mode 1)
++/*
++########
++# ipcacheSimulatorLookup -> const ipcache_addrs * (주소 목록, 실패하면 NULL)
++# squid --simulate에서 비동기 DNS 대신 쓰는 조회. ipcache_simulator_mode 2일 때만 getaddrinfo()로 동기 조회해
++# 중복을 뺀 주소(최대 32개)를 hosts_file 항목처럼 고정 캐시에 넣고, 1이면 조회하지 않는다.
++# 실패한 이름은 기억해 다시 막히는 조회를 하지 않는다.
++########
++*/
 +static const ipcache_addrs *
 +ipcacheSimulatorLookup(const char *name)
 +{
 +    if (ipcache_simulator_mode != 2)
 +        return NULL;
 +
-+    static std::set<std::string> failed; // do not repeat blocking lookups that failed
++    static std::set<std::string> failed;
 +    if (failed.count(name))
 +        return NULL;
 +
@@ -2245,30 +2847,33 @@
   \ingroup IPCacheAPI
 --- a/src/ipcache.h
 +++ b/src/ipcache.h
-@@ -41,5 +41,10 @@
+@@ -41,5 +41,14 @@
  void ipcache_restart(void);
  int ipcacheAddEntryFromHosts(const char *name, const char *ipaddr);
  
-+/// offline ACL simulator DNS behaviour (squid --simulate):
-+/// 0 = normal async DNS, 1 = no lookups (hosts_file only),
-+/// 2 = blocking system resolver (getaddrinfo) on cache misses
++/*
++########
++# ipcache_simulator_mode -> int
++# squid --simulate의 DNS 방식. 0 = 원래의 비동기 DNS, 1 = 조회하지 않음(hosts_file만),
++# 2 = 캐시에 없으면 시스템 리졸버(getaddrinfo)로 동기 조회.
++########
++*/
 +extern int ipcache_simulator_mode;
 +
  #endif /* _SQUID_IPCACHE_H */
  
 --- a/src/main.cc
 +++ b/src/main.cc
-@@ -135,6 +135,9 @@
+@@ -135,6 +135,8 @@
  #include <sys/wait.h>
  #endif
  
-+// offline http_access simulator (squid --simulate, --optimize)
 +#include "AclSimulator.cci"
 +
  #if USE_WIN32_SERVICE
  #include <process.h>
  
-@@ -404,7 +407,24 @@
+@@ -404,7 +406,24 @@
              "       -R        Do not set REUSEADDR on port.\n"
              "       -S        Double-check swap during rebuild.\n"
              "       -X        Force full debugging.\n"
@@ -2294,7 +2899,7 @@
              APP_SHORTNAME, CACHE_HTTP_PORT, DEFAULT_CONFIG_FILE, CACHE_ICP_PORT);
      exit(EXIT_FAILURE);
  }
-@@ -415,7 +435,14 @@
+@@ -415,7 +434,14 @@
      // not be used: Values below 2 are for special getopt_long(3) use cases, and
      // values in the [33,126] range are reserved for short options (-x).
      optForeground = 2,
@@ -2310,7 +2915,7 @@
  };
  
  // short options
-@@ -431,6 +458,13 @@
+@@ -431,6 +457,13 @@
  static struct option squidOptions[] = {
      {"foreground", no_argument, 0,  optForeground},
      {"kid",        required_argument, 0, optKid},
@@ -2324,17 +2929,15 @@
      {"help",       no_argument, 0, 'h'},
      {"version",    no_argument, 0, 'v'},
      {0, 0, 0, 0}
-@@ -708,6 +742,45 @@
+@@ -708,6 +741,43 @@
  
      case optKid:
          // already processed in ConfigureCurrentKid()
 +        break;
 +
 +    case optSimulate:
-+        /** \par --simulate
-+         * Replay an access.log through http_access rules and exit */
 +        AclSimulator::LogFile = optValue;
-+        Acl::CollectConfigNotes = true; // before squid.conf is parsed
++        Acl::CollectConfigNotes = true;
 +        opt_simulate = 1;
 +        break;
 +
@@ -2365,12 +2968,12 @@
 +
 +    case optOptimize:
 +        AclSimulator::Optimize = true;
-+        Acl::CollectConfigNotes = true; // before squid.conf is parsed
++        Acl::CollectConfigNotes = true;
 +        opt_simulate = 1;
          break;
  
      case 'h':
-@@ -1582,6 +1655,14 @@
+@@ -1582,6 +1652,14 @@
          if (opt_parse_cfg_only || parse_err > 0)
              return parse_err;
      }
@@ -2387,7 +2990,7 @@
      // Master optimization: Where possible, avoid pointless daemon fork() and/or
 --- a/src/acl/Acl.cc
 +++ b/src/acl/Acl.cc
-@@ -25,9 +25,75 @@
+@@ -25,9 +25,120 @@
  #include "SquidConfig.h"
  
  #include <algorithm>
@@ -2401,20 +3004,47 @@
 +std::map<std::string, unsigned> Acl::AclReferences;
 +std::set<std::string> Acl::PredefinedAcls;
 +
-+/// the ACL whose values are being parsed now (or nil)
++/*
++########
++# ParsingAcl -> const char * (없으면 nullptr)
++# 지금 값을 파싱하고 있는 ACL의 이름. NoteConfig()가 노트의 대상으로 쓴다.
++########
++*/
 +static const char *ParsingAcl = nullptr;
-+/// the type of ParsingAcl
++/*
++########
++# ParsingAclType -> const char *
++# ParsingAcl의 타입.
++########
++*/
 +static const char *ParsingAclType = nullptr;
-+/// values of each ACL seen so far, for duplicate detection
++/*
++########
++# SeenValues -> std::map<std::string, std::set<std::string> >
++# ACL 이름 -> 지금까지 나온 값. 정규식 ACL의 중복 값을 찾는다.
++########
++*/
 +static std::map<std::string, std::set<std::string> > SeenValues;
 +
-+/// whether we are parsing Squid's built-in defaults rather than squid.conf
++/*
++########
++# ParsingDefaults -> bool
++# 지금 squid.conf가 아니라 Squid 자체의 기본 설정("Default Configuration")을 파싱하는지. 내장 ACL을 가려낸다.
++########
++*/
 +static bool
 +ParsingDefaults()
 +{
 +    return cfg_filename && strncmp(cfg_filename, "Default Configuration", 21) == 0;
 +}
 +
++/*
++########
++# Acl::NoteConfig -> void (ConfigNotes에 추가)
++# 노트 수집이 켜져 있고 기본 설정을 파싱하는 중이 아니면, 주어진 ACL(없으면 지금 파싱 중인 ACL)에 대한
++# 노트를 파일:줄, 원래 줄과 함께 남긴다. 파싱 중이 아닐 때(매칭이 같은 비교 코드를 쓰는 경우)는 무시한다.
++########
++*/
 +void
 +Acl::NoteConfig(const char *kind, const std::string &message, const char *aclName, const char *aclType)
 +{
@@ -2425,7 +3055,7 @@
 +        aclType = ParsingAclType;
 +    }
 +    if (!aclName)
-+        return; // not parsing (e.g., matching uses the same comparison code)
++        return;
 +    ConfigNote note;
 +    note.kind = kind;
 +    note.acl = aclName;
@@ -2436,12 +3066,24 @@
 +    ConfigNotes.push_back(note);
 +}
 +
++/*
++########
++# Acl::SeenValue -> bool
++# 지금 파싱 중인 ACL에 이 값이 이미 있었는지. 처음 보는 값이면 기억하고 false.
++########
++*/
 +bool
 +Acl::SeenValue(const std::string &value)
 +{
 +    return CollectConfigNotes && ParsingAcl && !SeenValues[ParsingAcl].insert(value).second;
 +}
 +
++/*
++########
++# Acl::NoteReference -> void (AclReferences 갱신)
++# 지시어나 다른 ACL이 이 ACL 이름을 한 번 썼다고 센다. ACL 이름은 대소문자를 구분하지 않으므로 소문자로 센다.
++########
++*/
 +void
 +Acl::NoteReference(const char *aclName)
 +{
@@ -2449,10 +3091,16 @@
 +        return;
 +    std::string key(aclName);
 +    for (auto &c : key)
-+        c = tolower(static_cast<unsigned char>(c)); // ACL names are case-insensitive
++        c = tolower(static_cast<unsigned char>(c));
 +    ++AclReferences[key];
 +}
 +
++/*
++########
++# Acl::ClearConfigNotes -> void
++# 다른 squid.conf를 파싱하기 전에 노트, 참조 수, 본 값을 지운다(--sim-compare).
++########
++*/
 +void
 +Acl::ClearConfigNotes()
 +{
@@ -2463,7 +3111,7 @@
  
  namespace Acl {
  
-@@ -223,6 +289,7 @@
+@@ -223,6 +334,7 @@
      } else if (strcmp(theType, "proto") == 0 && strcmp(aclname, "manager") == 0) {
          // ACL manager is now a built-in and has a different type.
          debugs(28, DBG_PARSE_NOTE(DBG_IMPORTANT), "UPGRADE: ACL 'manager' is now a built-in ACL. Remove it from your config file.");
@@ -2471,20 +3119,20 @@
          return; // ignore the line
      }
  
-@@ -231,7 +298,12 @@
+@@ -231,7 +343,12 @@
          A = Acl::Make(theType);
          A->context(aclname, config_input_line);
          new_acl = 1;
 +        if (ParsingDefaults())
 +            Acl::PredefinedAcls.insert(aclname);
      } else {
-+        if (Acl::PredefinedAcls.count(aclname))
++        if (Acl::PredefinedAcls.count(A->name) && !ParsingDefaults())
 +            Acl::NoteConfig("predefined", std::string("'") + aclname + "' is a built-in ACL (" +
 +                            (A->cfgline ? A->cfgline : "") + "); this line only adds to it", aclname, theType);
          if (strcmp (A->typeString(),theType) ) {
              debugs(28, DBG_CRITICAL, "aclParseAclLine: ACL '" << A->name << "' already exists with different type.");
              parser.destruct();
-@@ -251,7 +323,11 @@
+@@ -251,7 +368,11 @@
      A->parseFlags();
  
      /*split the function here */
@@ -2510,39 +3158,85 @@
  
  class ConfigParser;
  
-@@ -29,6 +33,36 @@
+@@ -29,6 +33,82 @@
  typedef ACL *(*Maker)(TypeName typeName);
  /// use the given ACL Maker for all ACLs of the named type
  void RegisterMaker(TypeName typeName, Maker maker);
 +
-+/// a questionable "acl" line detail noticed while parsing (squid --optimize)
++/*
++########
++# ConfigNote -> 클래스: 파싱 중 발견한 acl 줄의 문제 하나 (squid --optimize)
++# kind: predefined(내장 ACL 재정의), covered(넓은 값에 포함), duplicate(중복 값), universal(모든 값에 매칭).
++# acl: ACL 이름, type: ACL 타입, where: 파일:줄, line: squid.conf 줄, message: 설명.
++########
++*/
 +class ConfigNote
 +{
 +public:
-+    std::string kind; ///< predefined, covered, duplicate, or universal
-+    std::string acl; ///< ACL name
-+    std::string type; ///< ACL type (e.g., dstdomain)
-+    std::string where; ///< file:line
-+    std::string line; ///< squid.conf line
++    std::string kind;
++    std::string acl;
++    std::string type;
++    std::string where;
++    std::string line;
 +    std::string message;
 +};
 +
-+/// whether parsing records the notes below (squid --simulate/--optimize only)
++/*
++########
++# CollectConfigNotes -> bool
++# 파싱이 아래 노트를 기록할지. squid --simulate / --optimize일 때만 true.
++########
++*/
 +extern bool CollectConfigNotes;
-+/// notes collected since the last ClearConfigNotes()
++/*
++########
++# ConfigNotes -> std::vector<ConfigNote>
++# 마지막 ClearConfigNotes() 이후 모은 노트.
++########
++*/
 +extern std::vector<ConfigNote> ConfigNotes;
-+/// how many times each (lowercased) ACL name is used by directives and other ACLs
++/*
++########
++# AclReferences -> std::map<std::string, unsigned>
++# 소문자 ACL 이름 -> 지시어와 다른 ACL이 그 이름을 쓴 횟수.
++########
++*/
 +extern std::map<std::string, unsigned> AclReferences;
-+/// names of ACLs created by Squid's own default configuration
++/*
++########
++# PredefinedAcls -> std::set<std::string>
++# Squid 자체 기본 설정이 만든 ACL 이름(all, manager, localhost 등).
++########
++*/
 +extern std::set<std::string> PredefinedAcls;
 +
-+/// records a note about the given (or the currently parsed) ACL
++/*
++########
++# NoteConfig -> void
++# 주어진(없으면 지금 파싱 중인) ACL에 대한 노트를 남긴다.
++########
++*/
 +void NoteConfig(const char *kind, const std::string &message, const char *aclName = nullptr, const char *aclType = nullptr);
-+/// whether the currently parsed ACL already had this value; remembers it
++/*
++########
++# SeenValue -> bool
++# 지금 파싱 중인 ACL에 이 값이 이미 있었는지. 처음이면 기억한다.
++########
++*/
 +bool SeenValue(const std::string &value);
-+/// counts one use of the named ACL by a directive or another ACL
++/*
++########
++# NoteReference -> void
++# 지시어나 다른 ACL이 이 ACL을 한 번 썼다고 센다.
++########
++*/
 +void NoteReference(const char *aclName);
-+/// forgets notes, references, and seen values (before parsing another squid.conf)
++/*
++########
++# ClearConfigNotes -> void
++# 다른 squid.conf를 파싱하기 전에 노트, 참조 수, 본 값을 지운다.
++########
++*/
 +void ClearConfigNotes();
  
  } // namespace Acl
@@ -2579,18 +3273,33 @@
  
 --- a/src/acl/Checklist.h
 +++ b/src/acl/Checklist.h
-@@ -141,6 +141,15 @@
+@@ -141,6 +141,30 @@
      /// Matches (or resumes matching of) a child node while maintaning
      /// resumption breadcrumbs if a [grand]child node goes async.
      bool matchChild(const Acl::InnerNode *parent, Acl::Nodes::const_iterator pos, const ACL *child);
 +
-+    /// Observer of individual node matching results, used by the offline
-+    /// ACL simulator (squid --simulate). The result is 1 (match), 0 (mismatch),
-+    /// or -1 (a slow ACL needed an async lookup that this check cannot do).
++    /*
++    ########
++    # TraceHook -> void (함수 형식)
++    # 노드 하나의 매칭 결과를 받는 관찰 함수 형식(squid --simulate). result는 1 매칭, 0 불일치,
++    # -1 비동기 조회가 필요한 느린 ACL이라 이 검사에서 평가할 수 없음.
++    ########
++    */
 +    typedef void TraceHook(const ACLChecklist *, const Acl::InnerNode *parent, const ACL *child, int result);
-+    static TraceHook *Tracer; ///< nil unless simulating
-+    /// simulator: Acl::Tree ignores its rules at positions [0, SkipRulesThrough]
-+    /// so that the rules matching after the decisive one can be found (-1: off)
++    /*
++    ########
++    # Tracer -> TraceHook *
++    # 시뮬레이터가 걸어 두는 관찰 함수. 평소에는 nullptr이라 아무 일도 하지 않는다.
++    ########
++    */
++    static TraceHook *Tracer;
++    /*
++    ########
++    # SkipRulesThrough -> int
++    # 시뮬레이터용. 0 이상이면 Acl::Tree가 위치 [0, SkipRulesThrough]의 규칙을 건너뛰어,
++    # 판정 규칙 뒤에서 매칭되는 규칙을 찾을 수 있게 한다. 평소에는 -1(끔).
++    ########
++    */
 +    static int SkipRulesThrough;
  
      /// Whether we should continue to match tree nodes or stop/pause.
@@ -2659,7 +3368,7 @@
              debugs(28, 3, "buffering RE '" << clean << "'");
              sl.emplace_back(clean);
 +            if (!strcmp(clean, "-i") || !strcmp(clean, "+i"))
-+                continue; // flags, not patterns
++                continue;
 +            if (!strcmp(clean, ".*") || !strcmp(clean, ".") || !strcmp(clean, "^"))
 +                Acl::NoteConfig("universal", std::string("regular expression '") + t + "' matches every value");
 +            else if (Acl::SeenValue(clean))

@@ -29,22 +29,25 @@ import datetime
 import glob
 import gzip
 import html
+import http.client
+import io
 import ipaddress
 import json
 import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_PAGES = ["info", "counters", "client_list", "ipcache", "fqdncache", "active_requests"]
-# cache manager actions that change squid; this tool only reads
 STATE_CHANGING = {"shutdown", "reconfigure", "rotate", "offline_toggle", "kill", "restart"}
 COUNTER_KEYS = ["client_http.requests", "client_http.hits", "client_http.errors",
                 "client_http.kbytes_in", "client_http.kbytes_out", "server.all.requests",
@@ -52,10 +55,14 @@ COUNTER_KEYS = ["client_http.requests", "client_http.hits", "client_http.errors"
 LOCAL_NAMES = re.compile(r"^(localhost|ip6-[a-z]+)(\.|$)", re.I)
 
 
-# ---------------------------------------------------------------- helpers
-
 def parse_duration(text):
-    """60m, 1h, 90s, 1h30m; a bare number means minutes"""
+    """
+    ########
+    # parse_duration -> float (초)
+    # "60m", "1h", "90s", "1h30m" 같은 기간을 초로 바꾼다. 단위 없는 숫자는 분으로 본다.
+    # 형식이 틀리면 argparse 오류를 낸다.
+    ########
+    """
     text = text.strip().lower()
     if re.fullmatch(r"\d+(\.\d+)?", text):
         return float(text) * 60
@@ -66,6 +73,12 @@ def parse_duration(text):
 
 
 def fmt_duration(seconds):
+    """
+    ########
+    # fmt_duration -> str ("1h5m3s" 형식)
+    # 초를 사람이 읽기 쉬운 기간 문자열로 바꾼다.
+    ########
+    """
     seconds = int(round(seconds))
     h, rest = divmod(seconds, 3600)
     m, s = divmod(rest, 60)
@@ -73,6 +86,12 @@ def fmt_duration(seconds):
 
 
 def is_local_addr(text):
+    """
+    ########
+    # is_local_addr -> bool
+    # 주소가 loopback(127.0.0.0/8, ::1, IPv4 매핑 포함)이거나 미지정 주소(0.0.0.0, ::)인지. 주소가 아니면 False.
+    ########
+    """
     text = text.strip().strip("[]")
     try:
         ip = ipaddress.ip_address(text)
@@ -84,6 +103,12 @@ def is_local_addr(text):
 
 
 def is_ip_literal(text):
+    """
+    ########
+    # is_ip_literal -> bool
+    # 문자열이 IP 주소인지(대괄호 IPv6 허용).
+    ########
+    """
     try:
         ipaddress.ip_address(text.strip("[]"))
         return True
@@ -92,29 +117,46 @@ def is_ip_literal(text):
 
 
 def first_http_port(conf):
-    """manager URL from the first http_port of squid.conf"""
-    try:
-        with open(conf, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                m = re.match(r"\s*http_port\s+(\S+)", line)
-                if not m:
-                    continue
-                spec = m.group(1)
-                port = spec.rsplit(":", 1)[-1] if ":" in spec else spec
-                if port.isdigit():
-                    host = spec.rsplit(":", 1)[0] if ":" in spec else "127.0.0.1"
-                    if host in ("", "0.0.0.0", "[::]", "*"):
-                        host = "127.0.0.1"
-                    return "http://%s:%s" % (host, port)
-    except OSError:
-        pass
+    """
+    ########
+    # first_http_port -> str ("http://호스트:포트")
+    # squid.conf(include 포함)의 첫 일반 http_port로 캐시 매니저 주소를 만든다. intercept, transparent, tproxy 포트는
+    # 매니저 요청을 받지 않으므로 건너뛴다. 모든 주소에서 듣는 포트면 127.0.0.1을 쓰고, 없으면 127.0.0.1:3128.
+    ########
+    """
+    for line in squid_conf_lines(conf):
+        words = line.split()
+        if words[0] != "http_port" or len(words) < 2:
+            continue
+        if any(w in ("intercept", "transparent", "tproxy") for w in words[2:]):
+            continue
+        spec = words[1]
+        port = spec.rsplit(":", 1)[-1] if ":" in spec else spec
+        if port.isdigit():
+            host = spec.rsplit(":", 1)[0] if ":" in spec else "127.0.0.1"
+            if host in ("", "0.0.0.0", "[::]", "*"):
+                host = "127.0.0.1"
+            return "http://%s:%s" % (host, port)
     return "http://127.0.0.1:3128"
 
 
-# ---------------------------------------------------------------- fetching
-
 class Manager:
+    """
+    ########
+    # Manager -> 클래스: 실행 중인 squid의 캐시 매니저 연결
+    # base: .../squid-internal-mgr 주소, headers: User-Agent와 (비밀번호가 있으면) Basic 인증,
+    # opener: 환경 변수의 프록시를 거치지 않는 연결, own_addr: squid가 보는 이 도구의 주소,
+    # requests/kbytes: 이 도구가 보낸 조회 수와 받은 양(카운터에서 빼기 위해).
+    ########
+    """
     def __init__(self, base, password=None, timeout=15):
+        """
+        ########
+        # __init__ -> None
+        # 주소 끝에 /squid-internal-mgr를 붙이고, 비밀번호가 있으면 "manager:비밀번호" Basic 인증 헤더를 만든다.
+        # squid에 직접 연결하도록 빈 ProxyHandler를 쓰고, 연결에 쓸 출발 주소를 미리 구해 둔다.
+        ########
+        """
         self.base = base.rstrip("/")
         if not self.base.endswith("/squid-internal-mgr"):
             self.base += "/squid-internal-mgr"
@@ -123,12 +165,18 @@ class Manager:
         if password:
             token = base64.b64encode(("manager:%s" % password).encode()).decode()
             self.headers["Authorization"] = "Basic " + token
-        # talk to squid directly, never through a proxy from the environment
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        self.requests = 0  # our own successful requests (subtracted from counters)
+        self.own_addr = source_address(self.base)
+        self.requests = 0
         self.kbytes = 0.0
 
     def get(self, page):
+        """
+        ########
+        # get -> str (페이지 본문)
+        # 매니저 페이지 하나를 GET으로 읽는다. 성공하면 자기 조회 수와 받은 KB를 센다. 실패하면 예외를 그대로 던진다.
+        ########
+        """
         req = urllib.request.Request("%s/%s" % (self.base, page), headers=self.headers)
         with self.opener.open(req, timeout=self.timeout) as resp:
             body = resp.read()
@@ -137,10 +185,14 @@ class Manager:
         return body.decode("utf-8", errors="replace")
 
 
-# ---------------------------------------------------------------- parsing
-
 def kid_blocks(text):
-    """squid 5+ wraps SMP-aware pages in 'by kidN { ... } by kidN'; returns the bodies"""
+    """
+    ########
+    # kid_blocks -> list[str] (워커별 본문)
+    # squid 5 이상은 SMP 페이지를 "by kidN { ... } by kidN"으로 감싼다. 그 안쪽 본문들을 돌려주고,
+    # 감싸지 않은 squid 4 출력이면 전체를 한 덩어리로 돌려준다.
+    ########
+    """
     blocks, current, inside = [], [], False
     for line in text.splitlines():
         if re.match(r"^by kid\d+ \{\s*$", line):
@@ -156,6 +208,12 @@ def kid_blocks(text):
 
 
 def parse_info(text):
+    """
+    ########
+    # parse_info -> dict (version, clients, uptime, cpu_pct, rss_kb, fd_in_use, fd_max, mem_kb, hit_pct_5min 등)
+    # info 페이지에서 버전과 주요 수치를 정규식으로 뽑는다. 없는 항목은 넣지 않는다.
+    ########
+    """
     info = {}
     m = re.search(r"Squid Object Cache: Version (\S+)", text)
     if m:
@@ -179,6 +237,12 @@ def parse_info(text):
 
 
 def parse_counters(text):
+    """
+    ########
+    # parse_counters -> dict (카운터 이름 -> 값)
+    # counters 페이지의 "이름 = 값" 줄을 읽어 워커별 값을 더한다. sample_time은 뺀다.
+    ########
+    """
     counters = {}
     for block in kid_blocks(text):
         for line in block.splitlines():
@@ -189,6 +253,13 @@ def parse_counters(text):
 
 
 def parse_client_list(text):
+    """
+    ########
+    # parse_client_list -> dict (주소 -> {name, http, codes})
+    # client_list 페이지에서 클라이언트마다 이름, HTTP 요청 수, 결과 코드별 수를 읽는다(ICP 구역은 무시).
+    # 워커별 값은 더한다.
+    ########
+    """
     clients = {}
     for block in kid_blocks(text):
         current = None
@@ -224,7 +295,13 @@ def parse_client_list(text):
 
 
 def parse_ipcache(text):
-    """hostname -> {flags, ttl, ips:[(ip, ok)]}"""
+    """
+    ########
+    # parse_ipcache -> dict (호스트 이름 -> {flags, ttl, ips:[(주소, 정상 여부)]})
+    # ipcache 표를 고정 폭(이름 32칸, 플래그 2칸)으로 읽는다. 주소가 다음 줄로 이어지면 앞 항목에 붙인다.
+    # 플래그 H는 hosts_file 항목, N은 실패해 부정 캐시된 항목.
+    ########
+    """
     entries = {}
     for block in kid_blocks(text):
         in_table, last = False, None
@@ -243,7 +320,7 @@ def parse_ipcache(text):
                 for ip, status in ips:
                     if (ip, status == "OK") not in last["ips"]:
                         last["ips"].append((ip, status == "OK"))
-            elif last is not None and ips:  # continuation line with more addresses
+            elif last is not None and ips:
                 for ip, status in ips:
                     if (ip, status == "OK") not in last["ips"]:
                         last["ips"].append((ip, status == "OK"))
@@ -251,7 +328,12 @@ def parse_ipcache(text):
 
 
 def parse_fqdncache(text):
-    """address -> {flags, names}"""
+    """
+    ########
+    # parse_fqdncache -> dict (주소 -> {flags, names})
+    # fqdncache 표를 고정 폭(주소 45칸)으로 읽어 역방향 이름과 플래그를 얻는다.
+    ########
+    """
     entries = {}
     for block in kid_blocks(text):
         in_table = False
@@ -270,12 +352,21 @@ def parse_fqdncache(text):
 
 
 def parse_active(text):
+    """
+    ########
+    # parse_active -> list[dict] (client, uri, logtype, age, user)
+    # active_requests 페이지에서 진행 중인 요청마다 클라이언트, URL, 로그 종류, 경과 초, 사용자를 읽는다.
+    # "Connection:"마다 클라이언트를 지워, remote 줄이 없는 요청이 앞 요청의 클라이언트를 물려받지 않게 한다.
+    ########
+    """
     reqs = []
     for block in kid_blocks(text):
         remote = None
         req = None
         for line in block.splitlines():
             s = line.strip()
+            if s.startswith("Connection:"):
+                remote = None
             m = re.match(r"^remote:\s*(\S+)", s)
             if m:
                 remote = m.group(1).rsplit(":", 1)[0].strip("[]")
@@ -296,25 +387,88 @@ def parse_active(text):
     return reqs
 
 
-# ---------------------------------------------------------------- filtering
-
-def filter_snapshot(snap, include_local):
-    """drops noise; returns the filtered copy"""
+def filter_snapshot(snap, include_local, own_addr=None):
+    """
+    ########
+    # filter_snapshot -> dict (걸러낸 사본)
+    # 의미 없는 항목을 뺀다: loopback과 이 도구가 쓰는 출발 주소의 클라이언트, hosts_file·localhost·IP 그대로인 DNS 이름,
+    # loopback 역방향 항목, 매니저 조회 자신의 진행 중 요청. 조회하지 않았거나 실패한 페이지의 구역은 만들지 않는다.
+    # --include-local이면 그대로 돌려준다.
+    ########
+    """
     out = dict(snap)
     if include_local:
         return out
-    out["clients"] = {a: c for a, c in snap.get("clients", {}).items() if not is_local_addr(a)}
-    out["ipcache"] = {h: e for h, e in snap.get("ipcache", {}).items()
-                      if "H" not in e["flags"] and not LOCAL_NAMES.match(h) and not is_ip_literal(h)}
-    out["fqdncache"] = {a: e for a, e in snap.get("fqdncache", {}).items()
-                        if "H" not in e["flags"] and not is_local_addr(a)}
-    out["active"] = [r for r in snap.get("active", [])
-                     if "/squid-internal-mgr/" not in r["uri"] and not r["uri"].startswith("cache_object:")
-                     and not is_local_addr(r["client"])]
+
+    def ours(addr):
+        """
+        ########
+        # ours -> bool
+        # 주소가 loopback이거나 이 도구가 squid에 연결할 때 쓰는 주소인지.
+        ########
+        """
+        return is_local_addr(addr) or (own_addr is not None and same_addr(addr, own_addr))
+
+    if "clients" in snap:
+        out["clients"] = {a: c for a, c in snap["clients"].items() if not ours(a)}
+    if "ipcache" in snap:
+        out["ipcache"] = {h: e for h, e in snap["ipcache"].items()
+                          if "H" not in e["flags"] and not LOCAL_NAMES.match(h) and not is_ip_literal(h)}
+    if "fqdncache" in snap:
+        out["fqdncache"] = {a: e for a, e in snap["fqdncache"].items()
+                            if "H" not in e["flags"] and not is_local_addr(a)}
+    if "active" in snap:
+        out["active"] = [r for r in snap["active"]
+                         if "/squid-internal-mgr/" not in r["uri"] and not r["uri"].startswith("cache_object:")
+                         and not ours(r["client"])]
     return out
 
 
+def same_addr(a, b):
+    """
+    ########
+    # same_addr -> bool
+    # 두 문자열이 같은 IP 주소인지(IPv4 매핑 IPv6는 IPv4로 보고 비교). 주소가 아니면 False.
+    ########
+    """
+    try:
+        x, y = ipaddress.ip_address(a.strip("[]")), ipaddress.ip_address(b.strip("[]"))
+    except ValueError:
+        return False
+    if x.version == 6 and x.ipv4_mapped:
+        x = x.ipv4_mapped
+    if y.version == 6 and y.ipv4_mapped:
+        y = y.ipv4_mapped
+    return x == y
+
+
+def source_address(base):
+    """
+    ########
+    # source_address -> str 또는 None
+    # squid 주소로 갈 때 쓰일 이 서버의 출발 주소. UDP 소켓을 connect()만 해서 커널이 고른 주소를 읽으므로
+    # 패킷을 보내지 않는다(TCP 연결을 열면 squid가 빈 요청을 access.log에 남긴다).
+    ########
+    """
+    try:
+        parsed = urllib.parse.urlsplit(base)
+        host, port = parsed.hostname, parsed.port or 80
+        family = socket.AF_INET6 if ":" in (host or "") else socket.AF_INET
+        with socket.socket(family, socket.SOCK_DGRAM) as s:
+            s.connect((host, port))
+            return s.getsockname()[0]
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def take_snapshot(mgr, pages, errors):
+    """
+    ########
+    # take_snapshot -> dict (time, 자기 조회 수, 페이지별 해석 결과)
+    # 페이지마다 조회해 해석기에 넣는다. 실패한 페이지는 시각과 함께 errors에 남기고 건너뛴다(연결, HTTP, 주소 오류 모두).
+    # 조회 직전의 자기 조회 수와 KB를 기록해 두어 구간 계산에서 뺄 수 있게 한다.
+    ########
+    """
     snap = {"time": time.time(), "own_requests_before": mgr.requests, "own_kbytes_before": mgr.kbytes}
     parsers = {"info": ("info", parse_info), "counters": ("counters", parse_counters),
                "client_list": ("clients", parse_client_list), "ipcache": ("ipcache", parse_ipcache),
@@ -322,7 +476,7 @@ def take_snapshot(mgr, pages, errors):
     for page in pages:
         try:
             text = mgr.get(page)
-        except (urllib.error.URLError, OSError) as e:
+        except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as e:
             errors.append("%s %s: %s" % (time.strftime("%H:%M:%S"), page, e))
             continue
         if page in parsers:
@@ -331,9 +485,14 @@ def take_snapshot(mgr, pages, errors):
     return snap
 
 
-# ---------------------------------------------------------------- one-shot output
-
 def print_snapshot(snap, base):
+    """
+    ########
+    # print_snapshot -> None (표준 출력)
+    # 한 번 조회한 결과를 구역별로 출력한다: 클라이언트(요청 수, 상위 결과 코드), 정방향 DNS(주소, TTL, 실패),
+    # 역방향 DNS, 진행 중 요청(오래된 순), 주요 카운터. 조회한 페이지의 구역만 나온다.
+    ########
+    """
     info = snap.get("info", {})
     print("# squid %s at %s, up %s" % (info.get("version", "?"), base, fmt_duration(info.get("uptime", 0))))
     if "clients" in snap:
@@ -371,13 +530,24 @@ def print_snapshot(snap, base):
                 print("  %-28s %d" % (key, snap["counters"][key]))
 
 
-# ---------------------------------------------------------------- recording and report
-
 def record(mgr, pages, duration, interval, out_dir, include_local):
+    """
+    ########
+    # record -> (snapshots, errors, start)
+    # duration 동안 interval마다 take_snapshot()과 filter_snapshot()을 하고 snapshots.jsonl에 한 줄씩 덧붙인다.
+    # 첫 조회는 바로 하고, 진행 상황을 표준 오류에 쓴다. Ctrl-C나 SIGTERM이면 그때까지의 결과로 끝낸다.
+    ########
+    """
     os.makedirs(out_dir, exist_ok=True)
     stop = {"now": False}
 
     def on_signal(signum, frame):
+        """
+        ########
+        # on_signal -> None
+        # 중단 신호를 받으면 멈춤 표시를 하고, 지금까지 모은 것으로 리포트를 쓴다고 알린다.
+        ########
+        """
         stop["now"] = True
         print("\nstopping early; writing the report with what was recorded", file=sys.stderr)
     signal.signal(signal.SIGINT, on_signal)
@@ -389,7 +559,7 @@ def record(mgr, pages, duration, interval, out_dir, include_local):
     path = os.path.join(out_dir, "snapshots.jsonl")
     with open(path, "a", encoding="utf-8") as jsonl:
         while True:
-            snap = filter_snapshot(take_snapshot(mgr, pages, errors), include_local)
+            snap = filter_snapshot(take_snapshot(mgr, pages, errors), include_local, mgr.own_addr)
             snaps.append(snap)
             jsonl.write(json.dumps(snap) + "\n")
             jsonl.flush()
@@ -407,22 +577,48 @@ def record(mgr, pages, duration, interval, out_dir, include_local):
     return snaps, errors, start
 
 
+def restarted_between(a, b):
+    """
+    ########
+    # restarted_between -> bool
+    # 두 스냅숏 사이에 squid가 재시작했는지. 가동 시간이 줄었거나 요청 카운터가 줄었으면 재시작으로 본다.
+    ########
+    """
+    up_a, up_b = a.get("info", {}).get("uptime"), b.get("info", {}).get("uptime")
+    if up_a is not None and up_b is not None and up_b < up_a:
+        return True
+    req_a = a.get("counters", {}).get("client_http.requests")
+    req_b = b.get("counters", {}).get("client_http.requests")
+    return req_a is not None and req_b is not None and req_b < req_a
+
+
 def summarize(snaps):
+    """
+    ########
+    # summarize -> dict (리포트에 쓸 요약)
+    # 스냅숏들로 기록 구간을 요약한다.
+    # 요청: 이웃한 스냅숏의 카운터 차이에서 자기 조회 수와 KB를 빼고, squid가 재시작한 구간은 뺀다(음수는 0).
+    # 클라이언트: 이웃한 스냅숏 사이의 증가분을 더한다. 재시작했거나 수가 줄었으면(항목이 지워졌다 다시 생김) 0부터 센다.
+    # DNS: 기록 중 캐시에서 본 이름, 주소, 실패 여부, 처음 스냅숏에 없던 이름(new).
+    # 그 밖에 역방향 DNS, 클라이언트·URL별로 가장 오래 걸린 진행 중 요청, 메모리·CPU 등의 최소/최대/마지막 값.
+    ########
+    """
     first, last = snaps[0], snaps[-1]
     s = {"start": first["time"], "end": last["time"], "polls": len(snaps),
          "version": last.get("info", {}).get("version") or first.get("info", {}).get("version", "?")}
 
-    # traffic per interval from counters, minus our own manager requests
+    restarted = [False] + [restarted_between(a, b) for a, b in zip(snaps, snaps[1:])]
+    s["restarts"] = sum(restarted)
+
     series = []
-    for a, b in zip(snaps, snaps[1:]):
-        if "counters" not in a or "counters" not in b:
+    for k in range(1, len(snaps)):
+        a, b = snaps[k - 1], snaps[k]
+        if "counters" not in a or "counters" not in b or restarted[k]:
             continue
         minutes = max((b["time"] - a["time"]) / 60.0, 1e-9)
         own = b["own_requests_before"] - a["own_requests_before"]
         own_kb = b["own_kbytes_before"] - a["own_kbytes_before"]
-        d = {k: b["counters"].get(k, 0) - a["counters"].get(k, 0) for k in COUNTER_KEYS}
-        if d["client_http.requests"] < 0:  # squid restarted
-            continue
+        d = {key: max(b["counters"].get(key, 0) - a["counters"].get(key, 0), 0) for key in COUNTER_KEYS}
         req = max(d["client_http.requests"] - own, 0)
         series.append({"t": b["time"], "minutes": minutes, "requests": req,
                        "per_min": req / minutes, "errors": d["client_http.errors"],
@@ -437,20 +633,25 @@ def summarize(snaps):
     minutes = (s["end"] - s["start"]) / 60.0
     s["avg_per_min"] = s["requests"] / minutes if minutes > 0 else 0
 
-    # clients: requests during the window (an address absent at first counts from zero)
-    start_counts = {a: c for a, c in first.get("clients", {}).items()}
     clients = {}
-    for snap in snaps:
-        for addr, c in snap.get("clients", {}).items():
-            base = start_counts.get(addr, {"http": 0, "codes": {}})
-            row = clients.setdefault(addr, {"name": c["name"], "first": snap["time"]})
-            row["requests"] = max(c["http"] - base["http"], 0)
-            row["codes"] = {k: max(v - base["codes"].get(k, 0), 0) for k, v in c["codes"].items()}
-            row["last"] = snap["time"]
+    previous, previous_index = None, -1
+    for k, snap in enumerate(snaps):
+        if "clients" not in snap:
+            continue
+        if previous is not None:
+            reset = any(restarted[previous_index + 1:k + 1])
+            for addr, c in snap["clients"].items():
+                before = None if reset else previous["clients"].get(addr)
+                if before is None or c["http"] < before["http"]:
+                    before = {"http": 0, "codes": {}}
+                row = clients.setdefault(addr, {"name": c["name"], "requests": 0, "codes": {}})
+                row["requests"] += c["http"] - before["http"]
+                for code, value in c["codes"].items():
+                    row["codes"][code] = row["codes"].get(code, 0) + max(value - before["codes"].get(code, 0), 0)
+        previous, previous_index = snap, k
     s["clients"] = sorted(([a, r] for a, r in clients.items() if r["requests"] > 0),
                           key=lambda ar: -ar[1]["requests"])
 
-    # DNS: names seen in the cache during the window
     dns = {}
     for snap in snaps:
         for host, e in snap.get("ipcache", {}).items():
@@ -459,7 +660,8 @@ def summarize(snaps):
             row["polls"] += 1
             row["ips"].update(ip for ip, ok in e["ips"])
             row["negative"] = row["negative"] or "N" in e["flags"]
-    initial = set(first.get("ipcache", {}))
+    first_dns = next((snap for snap in snaps if "ipcache" in snap), {})
+    initial = set(first_dns.get("ipcache", {}))
     s["dns"] = sorted(([h, dict(r, ips=sorted(r["ips"]), new=h not in initial)] for h, r in dns.items()),
                       key=lambda hr: (hr[1]["negative"], -hr[1]["polls"], hr[0]))
     rdns = {}
@@ -468,7 +670,6 @@ def summarize(snaps):
             rdns[addr] = {"names": e["names"], "negative": "N" in e["flags"]}
     s["rdns"] = sorted(rdns.items())
 
-    # active requests: the longest seen per client + URL
     active = {}
     for snap in snaps:
         for r in snap.get("active", []):
@@ -479,7 +680,6 @@ def summarize(snaps):
             row["seen"] += 1
     s["active"] = sorted(active.values(), key=lambda r: -r["max_age"])
 
-    # resources
     res = {}
     for key in ("rss_kb", "fd_in_use", "mem_kb", "cpu_pct"):
         values = [snap["info"][key] for snap in snaps if key in snap.get("info", {})]
@@ -490,6 +690,12 @@ def summarize(snaps):
 
 
 def write_text(s, errors, base, path):
+    """
+    ########
+    # write_text -> None (summary.txt)
+    # 요약을 텍스트로 쓴다: 기간, 조회 수, 재시작, 요청 수와 분당 평균·최대, 상위 클라이언트, DNS 이름, 오래 걸린 요청, 오류.
+    ########
+    """
     lines = []
     w = lines.append
     t0 = datetime.datetime.fromtimestamp(s["start"]).strftime("%Y-%m-%d %H:%M:%S")
@@ -497,6 +703,8 @@ def write_text(s, errors, base, path):
     w("squid cache manager report: squid %s at %s" % (s["version"], base))
     w("window: %s - %s (%s), %d polls, %d errors" % (t0, t1, fmt_duration(s["end"] - s["start"]), s["polls"], len(errors)))
     w("excluded: loopback clients, /etc/hosts and localhost DNS entries, manager requests")
+    if s["restarts"]:
+        w("squid restarted %d time(s) while recording; those intervals are left out" % s["restarts"])
     w("")
     w("requests %d  (avg %.1f/min, peak %.1f/min)  errors %d  hits %d  sent %.0f KB" % (
         s["requests"], s["avg_per_min"], s["peak_per_min"], s["errors"], s["hits"], s["kb_out"]))
@@ -530,14 +738,26 @@ def write_text(s, errors, base, path):
 
 
 def write_html(s, errors, base, path):
+    """
+    ########
+    # write_html -> None (report.html)
+    # 외부 파일 없이 열리는 HTML 리포트를 쓴다: 요약 카드, 분당 요청 막대그래프(SVG), 클라이언트, DNS(새 이름·실패 표시),
+    # 역방향 DNS, 오래 걸린 요청, 자원 사용, 오류. 라이트/다크 색을 모두 지원하고 모든 값을 HTML 이스케이프한다.
+    ########
+    """
     e = html.escape
     t0 = datetime.datetime.fromtimestamp(s["start"]).strftime("%Y-%m-%d %H:%M:%S")
     t1 = datetime.datetime.fromtimestamp(s["end"]).strftime("%Y-%m-%d %H:%M:%S")
 
     def card(label, value, cls=""):
+        """
+        ########
+        # card -> str (HTML)
+        # 요약 카드 하나(라벨, 값)를 만든다.
+        ########
+        """
         return '<div class="card %s"><div class="label">%s</div><div class="value">%s</div></div>' % (cls, e(label), e(value))
 
-    # requests per interval as an inline SVG bar chart
     series = s["series"]
     chart = '<p class="muted">Not enough polls for a traffic chart.</p>'
     if series:
@@ -619,30 +839,47 @@ th{font-size:12px;color:var(--muted)}tbody tr:last-child td{border-bottom:0}.num
         f.write(doc)
 
 
-# ---------------------------------------------------------------- simulator configuration (squid-sim.conf)
-
 SIM_CONF_DEFAULTS = {
     "squid_conf": "/etc/squid/squid.conf",
-    "access_log": "auto",       # auto = the first file access_log of squid_conf
-    "log_format": "auto",       # auto = detect; or a logformat name
-    "local_ip": "auto",         # %la when the format has none; auto = http_port address, if any
-    "log_timezone": "local",    # offset for %ts/%tg times: local or +0900
-    "sim_port": "auto",         # --sim-port
-    "sim_dns": "auto",          # --sim-dns off|system
-    "manager_url": "auto",      # --manager --url
-    "manager_password_env": "",  # --manager --password-env
+    "access_log": "auto",
+    "log_format": "auto",
+    "local_ip": "auto",
+    "log_timezone": "local",
+    "sim_port": "auto",
+    "sim_dns": "auto",
+    "manager_url": "auto",
+    "manager_password_env": "",
 }
 
 
 class SimConf:
+    """
+    ########
+    # SimConf -> 클래스: squid-sim.conf 설정
+    # settings: 지시어 -> 값(SIM_CONF_DEFAULTS로 시작), formats: 이 파일의 logformat 정의, path: 읽은 파일.
+    ########
+    """
     def __init__(self, path=None):
+        """
+        ########
+        # __init__ -> None
+        # 기본값으로 시작해, 파일이 주어지면 읽는다.
+        ########
+        """
         self.path = path
         self.settings = dict(SIM_CONF_DEFAULTS)
-        self.formats = {}  # logformat lines of squid-sim.conf, in order
+        self.formats = {}
         if path:
             self.read(path)
 
     def read(self, path):
+        """
+        ########
+        # read -> None (settings, formats 갱신)
+        # 한 줄에 지시어 하나를 읽는다. logformat은 이름과 줄 끝까지의 형식을, 나머지는 첫 단어만 값으로 쓴다(뒤는 주석).
+        # squid_conf와 access_log의 상대 경로는 이 파일의 디렉터리 기준으로 바꾼다. 모르는 지시어면 줄 번호와 함께 끝낸다.
+        ########
+        """
         try:
             f = open(path, encoding="utf-8", errors="replace")
         except OSError as e:
@@ -661,18 +898,29 @@ class SimConf:
                     continue
                 if key not in SIM_CONF_DEFAULTS or len(words) < 2:
                     sys.exit("squid-sim: %s:%d: unknown or incomplete directive: %s" % (path, number, line))
-                # values are single words; anything after them is a comment
                 value = words[1]
                 if key in ("squid_conf", "access_log") and value != "auto" and not os.path.isabs(value):
                     value = os.path.join(os.path.dirname(os.path.abspath(path)), value)
                 self.settings[key] = value
 
     def get(self, key):
+        """
+        ########
+        # get -> str 또는 None
+        # 지시어 값. auto이거나 비어 있으면 None(알아서 정하라는 뜻).
+        ########
+        """
         value = self.settings[key]
         return None if value in ("auto", "") else value
 
 
 def find_sim_conf(explicit):
+    """
+    ########
+    # find_sim_conf -> str 또는 None (설정 파일 경로)
+    # --sim-conf, $SQUID_SIM_CONF, /etc/squid/squid-sim.conf, 저장소의 squid-sim.conf 중 처음 있는 것.
+    ########
+    """
     if explicit:
         return explicit
     for path in (os.environ.get("SQUID_SIM_CONF"), "/etc/squid/squid-sim.conf", os.path.join(ROOT, "squid-sim.conf")):
@@ -681,45 +929,84 @@ def find_sim_conf(explicit):
     return None
 
 
+def squid_conf_lines(path, depth=0):
+    """
+    ########
+    # squid_conf_lines -> 반복자 (주석과 빈 줄을 뺀 줄)
+    # squid.conf를 읽으며 include 지시어의 파일(glob 패턴, 정렬)을 그 자리에서 이어 읽는다.
+    # 읽을 수 없는 파일은 건너뛰고, 16단계보다 깊은 include는 무시한다.
+    ########
+    """
+    if depth > 16:
+        return
+    try:
+        f = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            words = line.split()
+            if words[0] == "include":
+                for pattern in words[1:]:
+                    for included in sorted(glob.glob(pattern)):
+                        yield from squid_conf_lines(included, depth + 1)
+                continue
+            yield line
+
+
 class SquidConf:
-    """the parts of squid.conf that describe its access.log"""
+    """
+    ########
+    # SquidConf -> 클래스: squid.conf 중 access.log와 관련된 부분
+    # formats: logformat 정의, logs: access_log의 (위치, 형식 이름), has_access_log: access_log 줄이 있었는지,
+    # port_ip: 첫 http_port에 적힌 주소, uses_local_ip: localip/myip ACL을 쓰는지.
+    ########
+    """
 
     def __init__(self, path):
+        """
+        ########
+        # __init__ -> None
+        # squid_conf_lines()로 읽으며 logformat, access_log(옛 형식 "파일 형식"과 logformat=이름 모두), http_port 주소,
+        # localip/myip ACL을 모은다.
+        ########
+        """
         self.path = path
         self.formats = {}
-        self.logs = []  # (file, format name or None)
+        self.logs = []
         self.has_access_log = False
         self.port_ip = None
         self.uses_local_ip = False
-        try:
-            f = open(path, encoding="utf-8", errors="replace")
-        except OSError:
-            return
-        with f:
-            for raw in f:
-                line = raw.strip()
-                if not line or line.startswith("#"):
+        for line in squid_conf_lines(path):
+            words = line.split()
+            if words[0] == "logformat" and len(words) >= 3:
+                self.formats[words[1]] = line.split(None, 2)[2]
+            elif words[0] == "access_log" and len(words) >= 2:
+                self.has_access_log = True
+                if words[1] == "none":
                     continue
-                words = line.split()
-                if words[0] == "logformat" and len(words) >= 3:
-                    self.formats[words[1]] = line.split(None, 2)[2]
-                elif words[0] == "access_log" and len(words) >= 2:
-                    self.has_access_log = True
-                    if words[1] == "none":
-                        continue
-                    name = next((w.split("=", 1)[1] for w in words[2:] if w.startswith("logformat=")), None)
-                    if name is None and len(words) >= 3 and "=" not in words[2]:
-                        name = words[2]  # access_log FILE FORMAT [acl ...]; checked later
-                    self.logs.append((words[1], name))
-                elif words[0] == "http_port" and len(words) >= 2 and self.port_ip is None:
-                    m = re.match(r"^\[?([0-9a-fA-F.:]+?)\]?:\d+$", words[1])
-                    if m and is_ip_literal(m.group(1)) and not ipaddress.ip_address(m.group(1)).is_unspecified:
-                        self.port_ip = m.group(1)
-                elif words[0] == "acl" and len(words) >= 3 and words[2] in ("localip", "myip"):
-                    self.uses_local_ip = True
+                name = next((w.split("=", 1)[1] for w in words[2:] if w.startswith("logformat=")), None)
+                if name is None and len(words) >= 3 and "=" not in words[2]:
+                    name = words[2]
+                self.logs.append((words[1], name))
+            elif words[0] == "http_port" and len(words) >= 2 and self.port_ip is None:
+                m = re.match(r"^\[?([0-9a-fA-F.:]+?)\]?:\d+$", words[1])
+                if m and is_ip_literal(m.group(1)) and not ipaddress.ip_address(m.group(1)).is_unspecified:
+                    self.port_ip = m.group(1)
+            elif words[0] == "acl" and len(words) >= 3 and words[2] in ("localip", "myip"):
+                self.uses_local_ip = True
 
     def log_file(self):
-        """first access_log that is a local file; without access_log lines, squid's default"""
+        """
+        ########
+        # log_file -> str 또는 None
+        # 첫 파일 access_log 경로(daemon:, stdio: 접두어 제거). access_log 줄이 아예 없으면 squid 기본값
+        # /var/log/squid/access.log. 파일이 아닌 곳(udp:, syslog: 등)뿐이면 None.
+        ########
+        """
         if not self.has_access_log and os.path.isfile(self.path):
             return DEFAULT_ACCESS_LOG
         for place, _ in self.logs:
@@ -730,7 +1017,13 @@ class SquidConf:
         return None
 
     def log_format(self):
-        """format name of the first access_log; squid's default is 'squid'"""
+        """
+        ########
+        # log_format -> str 또는 None
+        # 첫 access_log가 쓰는 형식 이름. 정의되지 않은 이름이거나 형식을 적지 않았으면 squid 기본값 squid.
+        # access_log 줄이 없어도 squid. access_log none뿐이면 None.
+        ########
+        """
         if not self.has_access_log and os.path.isfile(self.path):
             return "squid"
         for _, name in self.logs:
@@ -738,11 +1031,8 @@ class SquidConf:
         return None
 
 
-# ---------------------------------------------------------------- log formats
-
 SIMULFORMAT = '%tl %la %>a "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh'
-DEFAULT_ACCESS_LOG = "/var/log/squid/access.log"  # squid's default (Debian/Ubuntu --with-logdir)
-# squid's predefined logformats (src/log/FormatSquid*.cc), plus the simulator's own
+DEFAULT_ACCESS_LOG = "/var/log/squid/access.log"
 BUILTIN_FORMATS = {
     "simulformat": SIMULFORMAT,
     "squid": "%ts.%03tu %6tr %>a %Ss/%03>Hs %<st %rm %ru %[un %Sh/%<a %mt",
@@ -750,7 +1040,6 @@ BUILTIN_FORMATS = {
     "combined": '%>a %[ui %[un [%tl] "%rm %ru HTTP/%rv" %>Hs %<st "%{Referer}>h" "%{User-Agent}>h" %Ss:%Sh',
     "referrer": "%ts.%03tu %>a %{Referer}>h %ru",
 }
-# format codes, so that "%Ss/%03>Hs" splits into Ss, "/", >Hs; unknown codes fall back to FALLBACK_CODE
 KNOWN_CODES = sorted("""
     >a >A >p >la >lp >eui >qos >nfmark la lp <a <A <p <la <lp <qos <nfmark
     ts tu tl tg tr tt dt tS tR busy_time rm ru rp rv rG >rm >ru >rp >rv >rs >rd >rP >rdp <rm <ru <rp <rv <rs <rd <rP
@@ -764,17 +1053,89 @@ KNOWN_CODES = sorted("""
 FIELD_PREFIX = re.compile(r'%([-"\[#\'/]*)(0?\d+)?(?:\.\d+)?(\{[^}]*\})?')
 FALLBACK_CODE = re.compile(r"(?:[a-z_]+::)?[<>]?[A-Za-z_]+")
 ARGUMENT = re.compile(r"\{[^}]*\}")
-# what each code feeds into the simulformat line
 ROLES = {"tl": "tl", "tg": "tg", "ts": "ts", "la": "la", ">la": "la", ">a": "client", "rm": "method", ">rm": "method",
          "ru": "url", ">ru": "url", "rv": "version", ">rv": "version", ">Hs": "status", "Hs": "status",
          "<st": "size", "st": "size", "Ss": "ss", "Sh": "sh"}
-DATE = r"\d{1,2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4}"
+TIME_DEFAULTS = {"tl": "%d/%b/%Y:%H:%M:%S %z", "tg": "%d/%b/%Y:%H:%M:%S"}
+STRFTIME_REGEX = {"d": r"\d{1,2}", "e": r"\s?\d{1,2}", "m": r"\d{1,2}", "b": r"[A-Za-z]{3}", "h": r"[A-Za-z]{3}",
+                  "B": r"[A-Za-z]+", "a": r"[A-Za-z]{3}", "A": r"[A-Za-z]+", "Y": r"\d{4}", "y": r"\d{2}",
+                  "H": r"\d{1,2}", "I": r"\d{1,2}", "M": r"\d{2}", "S": r"\d{2}", "p": r"[AaPp][Mm]",
+                  "j": r"\d{3}", "z": r"[+-]\d{4}", "Z": r"[A-Za-z]+", "T": r"\d{1,2}:\d{2}:\d{2}",
+                  "F": r"\d{4}-\d{1,2}-\d{1,2}", "s": r"\d+", "%": "%"}
+STRPTIME_ALIASES = {"e": "%d", "h": "%b", "T": "%H:%M:%S", "F": "%Y-%m-%d"}
 NUMERIC = {"ts", "tu", "tr", "tt", "dt", "<pt", "<tt", "<st", ">st", "st", "<sh", ">sh", "<bs", ">bs"}
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+HOST_PORT = re.compile(r"^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):\d+$")
+
+
+def strftime_regex(spec):
+    """
+    ########
+    # strftime_regex -> str (정규식)
+    # squid가 시각에 쓰는 strftime 형식(%d/%b/%Y:%H:%M:%S %z 등)을 그 출력에 맞는 정규식으로 바꾼다.
+    # 공백은 하나 이상의 공백으로 보고, 모르는 지시자면 ValueError.
+    ########
+    """
+    parts, i = [], 0
+    while i < len(spec):
+        if spec[i] == "%" and i + 1 < len(spec):
+            directive = spec[i + 1]
+            if directive not in STRFTIME_REGEX:
+                raise ValueError("unsupported time directive %%%s in %r" % (directive, spec))
+            parts.append(STRFTIME_REGEX[directive])
+            i += 2
+            continue
+        parts.append(r"\s+" if spec[i].isspace() else re.escape(spec[i]))
+        i += 1
+    return "".join(parts)
+
+
+def strptime_spec(spec):
+    """
+    ########
+    # strptime_spec -> str
+    # strptime이 모르는 strftime 지시자를 같은 뜻으로 바꾼다: %e -> %d, %h -> %b, %T -> %H:%M:%S, %F -> %Y-%m-%d.
+    ########
+    """
+    return re.sub(r"%([eThF])", lambda m: STRPTIME_ALIASES[m.group(1)], spec)
+
+
+def parse_offset(text):
+    """
+    ########
+    # parse_offset -> int 또는 None (UTC 오프셋 초)
+    # log_timezone 값을 읽는다. local이면 None(이 서버의 타임존, 서머타임 포함), +0900이나 +09:00이면 초.
+    # 형식이 틀리면 바로 끝낸다(변환 도중이 아니라 시작할 때).
+    ########
+    """
+    if text == "local":
+        return None
+    m = re.fullmatch(r"([+-])(\d\d):?(\d\d)", text)
+    if not m:
+        sys.exit("squid-sim: log_timezone must be local or like +0900, not %r" % text)
+    return (1 if m.group(1) == "+" else -1) * (int(m.group(2)) * 3600 + int(m.group(3)) * 60)
+
+
+def unescape(value):
+    """
+    ########
+    # unescape -> str
+    # squid의 %"코드 출력처럼 백슬래시로 이스케이프된 값을 원래대로 되돌린다(n, r, t는 제어 문자로).
+    ########
+    """
+    return re.sub(r"\\(.)", lambda m: {"n": "\n", "r": "\r", "t": "\t"}.get(m.group(1), m.group(1)), value)
 
 
 def parse_format(spec):
-    """logformat text -> [("lit", text) | ("field", code, quoted, padded)]"""
+    """
+    ########
+    # parse_format -> list (('lit', 텍스트) 또는 ('field', 코드, 따옴표, 너비, 인자))
+    # squid logformat 문자열을 리터럴과 필드로 나눈다. %% 는 리터럴 %.
+    # 필드는 % 뒤에 인코딩(" [ # ' /), 정렬(-), 너비(0 채움 포함), .최대, {인자}가 오고 코드가 온다.
+    # 코드는 알려진 코드 중 가장 긴 것을 먼저 맞추고(%Ss/%03>Hs가 Ss, /, >Hs로 나뉘도록), 모르면 FALLBACK_CODE로 읽는다.
+    # {인자}는 코드 앞이나 뒤 어느 쪽이든 받는다.
+    ########
+    """
     items, lit, i = [], "", 0
     while i < len(spec):
         if spec[i] != "%":
@@ -794,13 +1155,16 @@ def parse_format(spec):
                 raise ValueError("cannot read the format code at %r" % spec[i:i + 12])
             code = m.group(0)
         j += len(code)
+        argument = prefix.group(3)
         arg = ARGUMENT.match(spec, j)
         if arg:
             j = arg.end()
+            argument = argument or arg.group(0)
         if lit:
             items.append(("lit", lit))
             lit = ""
-        items.append(("field", code, '"' in prefix.group(1), bool(prefix.group(2))))
+        items.append(("field", code, '"' in prefix.group(1), bool(prefix.group(2)),
+                      argument[1:-1] if argument else None))
         i = j
     if lit:
         items.append(("lit", lit))
@@ -808,27 +1172,49 @@ def parse_format(spec):
 
 
 class LogFormat:
-    """matches lines of one logformat and rewrites them as simulformat"""
+    """
+    ########
+    # LogFormat -> 클래스: 한 logformat의 줄 판별·변환기
+    # regex: 줄 전체에 맞는 정규식, roles: 정규식 그룹이 simulformat의 어떤 값인지, time_specs: 시각 필드의 strftime 형식,
+    # quoted: 따옴표 인코딩된 값, missing: 없는 필수 필드(%>a, %ru), has_local_ip, has_time,
+    # passthrough: 이미 simulformat이라 변환이 필요 없는지, offset: 시각 변환에 쓸 UTC 오프셋.
+    ########
+    """
 
     def __init__(self, name, spec, local_ip=None, timezone="local"):
+        """
+        ########
+        # __init__ -> None
+        # parse_format() 결과로 정규식을 만든다. 리터럴의 공백은 하나 이상의 공백으로, 필드 값은 문맥에 맞춰:
+        # 따옴표 인코딩이면 이스케이프를 허용한 따옴표 문자열, 시각이면 그 strftime 형식의 정규식, 숫자 코드면 숫자 또는 -,
+        # 따옴표 사이면 따옴표가 아닌 문자, 뒤에 공백 아닌 리터럴이 붙으면 그 문자를 뺀 문자, 그 밖에는 공백 아닌 문자.
+        # 너비가 있으면 앞쪽 채움 공백을 허용한다.
+        ########
+        """
         self.name, self.spec = name, spec
         self.local_ip = local_ip or "-"
-        self.timezone = timezone
+        self.offset = parse_offset(timezone)
         items = parse_format(spec)
-        parts, self.roles = [], []
+        parts, self.roles, self.time_specs, self.quoted = [], [], {}, set()
         for k, item in enumerate(items):
             if item[0] == "lit":
                 text = item[1]
                 chunks = re.split(r"(\s+)", text)
                 parts.append("".join(r"\s+" if c.isspace() else re.escape(c) for c in chunks if c))
                 continue
-            _, code, quoted, padded = item
+            _, code, quoted, padded, argument = item
             before = items[k - 1][1] if k and items[k - 1][0] == "lit" else ""
             after = items[k + 1][1] if k + 1 < len(items) and items[k + 1][0] == "lit" else ""
+            role = ROLES.get(code)
             if quoted:
                 value = r'"(?:[^"\\]|\\.)*"'
-            elif code in ("tl", "tg"):
-                value = DATE
+                if role:
+                    self.quoted.add(role)
+            elif code in TIME_DEFAULTS:
+                time_spec = argument or TIME_DEFAULTS[code]
+                value = strftime_regex(time_spec)
+                if role and role not in self.time_specs:
+                    self.time_specs[role] = time_spec
             elif code in NUMERIC:
                 value = r"-|-?\d+"
             elif before.endswith('"') and after.startswith('"'):
@@ -837,7 +1223,6 @@ class LogFormat:
                 value = r"[^\s%s]+" % re.escape(after[0])
             else:
                 value = r"\S+"
-            role = ROLES.get(code)
             if role:
                 self.roles.append(role)
             parts.append((r"\s*" if padded else "") + ("(%s)" if role else "(?:%s)") % value)
@@ -849,22 +1234,71 @@ class LogFormat:
         self.passthrough = " ".join(spec.split()) == SIMULFORMAT
 
     def local_time(self, epoch):
-        if self.timezone == "local":
+        """
+        ########
+        # local_time -> str (%tl 형식 "02/Nov/2026:10:00:00 +0900")
+        # UTC epoch를 log_timezone의 현지 시각으로 쓴다. local이면 그 시각의 이 서버 오프셋(서머타임 포함)을 쓴다.
+        ########
+        """
+        if self.offset is None:
             tm = time.localtime(epoch)
             offset = tm.tm_gmtoff
         else:
-            m = re.fullmatch(r"([+-])(\d\d):?(\d\d)", self.timezone)
-            if not m:
-                sys.exit("squid-sim: log_timezone must be local or like +0900, not %r" % self.timezone)
-            offset = (1 if m.group(1) == "+" else -1) * (int(m.group(2)) * 3600 + int(m.group(3)) * 60)
+            offset = self.offset
             tm = time.gmtime(epoch + offset)
         sign = "-" if offset < 0 else "+"
         return "%02d/%s/%04d:%02d:%02d:%02d %s%02d%02d" % (
             tm.tm_mday, MONTHS[tm.tm_mon - 1], tm.tm_year, tm.tm_hour, tm.tm_min, tm.tm_sec,
             sign, abs(offset) // 3600, abs(offset) % 3600 // 60)
 
+    def epoch(self, value, spec, utc):
+        """
+        ########
+        # epoch -> int (UTC epoch)
+        # 시각 문자열을 strftime 형식으로 읽는다. %s면 그대로 숫자. 값에 %z가 있으면 그 오프셋을, 없으면
+        # %tg는 UTC로, %tl은 log_timezone(또는 이 서버의 현지 시각)으로 해석한다. 읽지 못하면 ValueError.
+        ########
+        """
+        if spec == "%s":
+            return int(value)
+        stamp = datetime.datetime.strptime(" ".join(value.split()), strptime_spec(spec))
+        if stamp.tzinfo is not None:
+            return int(stamp.timestamp())
+        if utc:
+            return calendar.timegm(stamp.timetuple())
+        if self.offset is not None:
+            return calendar.timegm(stamp.timetuple()) - self.offset
+        return int(time.mktime(stamp.timetuple()))
+
+    def when(self, v):
+        """
+        ########
+        # when -> str 또는 None
+        # simulformat에 넣을 시각. 기본 형식의 %tl은 그대로 쓰고, 다른 형식의 %tl·%tg·%ts는 epoch를 거쳐 현지 시각으로 바꾼다.
+        # 시각 필드가 없으면 "- -"(시뮬레이터가 현재 시각을 쓰고 경고), 시각을 읽지 못하면 None(그 줄은 맞지 않는 줄).
+        ########
+        """
+        try:
+            if "tl" in v:
+                if self.time_specs["tl"] == TIME_DEFAULTS["tl"]:
+                    return v["tl"]
+                return self.local_time(self.epoch(v["tl"], self.time_specs["tl"], False))
+            if "tg" in v:
+                return self.local_time(self.epoch(v["tg"], self.time_specs["tg"], True))
+        except ValueError:
+            return None
+        if v.get("ts", "-").isdigit():
+            return self.local_time(int(v["ts"]))
+        return "- -"
+
     def convert(self, line):
-        """simulformat line, or None when the line does not match"""
+        """
+        ########
+        # convert -> str 또는 None
+        # 줄 하나를 simulformat으로 바꾼다. 맞지 않으면 None. 따옴표 인코딩 값은 따옴표를 벗기고 이스케이프를 푼다.
+        # %la가 없으면 local_ip, %rm이 없으면 URL이 호스트:포트면 CONNECT 아니면 GET, %rv가 없으면 1.1, 나머지는 -.
+        ########
+        """
         m = self.regex.match(line)
         if not m:
             return None
@@ -872,36 +1306,38 @@ class LogFormat:
         for role, value in zip(self.roles, m.groups()):
             if value is None:
                 continue
-            if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
-                value = value[1:-1]
+            if role in self.quoted and len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+                value = unescape(value[1:-1])
             v.setdefault(role, value)
-        if "tl" in v:
-            when = v["tl"]
-        elif "tg" in v:
-            d = re.match(r"(\d+)/(\w+)/(\d+):(\d+):(\d+):(\d+)", v["tg"])
-            epoch = calendar.timegm((int(d.group(3)), MONTHS.index(d.group(2).title()) + 1, int(d.group(1)),
-                                     int(d.group(4)), int(d.group(5)), int(d.group(6))))
-            when = self.local_time(epoch)
-        elif v.get("ts", "-").isdigit():
-            when = self.local_time(int(v["ts"]))
-        else:
-            when = "- -"
+        when = self.when(v)
+        if when is None:
+            return None
         url = v.get("url", "-")
-        method = v.get("method") or ("GET" if "://" in url else "CONNECT")
+        method = v.get("method") or ("CONNECT" if HOST_PORT.match(url) else "GET")
         return '%s %s %s "%s %s HTTP/%s" %s %s %s:%s' % (
             when, v.get("la", self.local_ip), v.get("client", "-"), method, url, v.get("version", "1.1"),
             v.get("status", "-"), v.get("size", "-"), v.get("ss", "-"), v.get("sh", "-"))
 
 
 def open_log(path):
-    if path == "-":
-        return sys.stdin
+    """
+    ########
+    # open_log -> 텍스트 파일 객체
+    # 로그를 연다(.gz면 gzip). UTF-8이 아닌 바이트는 surrogateescape로 보존해 URL이 바뀌지 않게 하고, 줄 끝은 그대로 둔다.
+    ########
+    """
     if path.endswith(".gz"):
-        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
-    return open(path, encoding="utf-8", errors="replace")
+        return gzip.open(path, "rt", encoding="utf-8", errors="surrogateescape", newline="")
+    return open(path, encoding="utf-8", errors="surrogateescape", newline="")
 
 
 def sample_lines(path, count=50):
+    """
+    ########
+    # sample_lines -> list[str]
+    # 주석과 빈 줄을 뺀 처음 count개 줄. 형식 판별에 쓴다.
+    ########
+    """
     lines = []
     with open_log(path) as f:
         for line in f:
@@ -914,10 +1350,17 @@ def sample_lines(path, count=50):
 
 
 def choose_format(log, sim, squid):
-    """(LogFormat, how it was chosen) for the log file"""
+    """
+    ########
+    # choose_format -> (LogFormat, 판별 근거 문자열)
+    # 로그 형식을 정한다. log_format이 지정돼 있으면 그 형식(squid-sim.conf, squid.conf, 미리 정의된 형식 순으로 찾음).
+    # auto면 처음 50줄을 squid.conf가 쓰는 형식, 설정 파일의 logformat, squid.conf의 logformat, 미리 정의된 형식 순으로
+    # 맞춰 보고 가장 많이 맞는 것(같으면 앞 순서)을 고른다. 하나도 맞지 않으면 시도한 형식을 보여 주고 끝낸다.
+    ########
+    """
     formats = {}
     for source in (BUILTIN_FORMATS, squid.formats, sim.formats):
-        formats.update(source)  # squid-sim.conf wins over squid.conf, which wins over built-ins
+        formats.update(source)
     local_ip = sim.get("local_ip") or squid.port_ip
     tz = sim.settings["log_timezone"]
     wanted = sim.get("log_format")
@@ -949,7 +1392,13 @@ def choose_format(log, sim, squid):
 
 
 def convert_log(path, fmt, out):
-    """writes simulformat lines; keeps comments and line numbers, unreadable lines stay unreadable"""
+    """
+    ########
+    # convert_log -> (변환한 줄 수, 맞지 않은 줄 수)
+    # 로그 전체를 simulformat으로 out에 쓴다. 주석과 빈 줄은 그대로 두어 줄 번호를 유지하고,
+    # 맞지 않는 줄은 따옴표를 바꿔 squid가 SKIP으로 보고하게 원문을 남긴다.
+    ########
+    """
     converted = unmatched = 0
     with open_log(path) as f:
         for line in f:
@@ -960,16 +1409,20 @@ def convert_log(path, fmt, out):
             new = fmt.convert(line)
             if new is None:
                 unmatched += 1
-                new = line.replace('"', "'")  # no quotes: squid reports it as an unparsed line
+                new = line.replace('"', "'")
             else:
                 converted += 1
             out.write(new + "\n")
     return converted, unmatched
 
 
-# ---------------------------------------------------------------- simulator pass-through
-
 def find_binary(explicit):
+    """
+    ########
+    # find_binary -> str 또는 None
+    # 패치한 squid 경로: --binary, $SQUID_SIM_BINARY, 저장소의 build/squid-*/src/squid 순.
+    ########
+    """
     if explicit:
         return explicit
     if os.environ.get("SQUID_SIM_BINARY"):
@@ -979,7 +1432,13 @@ def find_binary(explicit):
 
 
 def take_option(argv, names, has_value=True):
-    """removes --name VALUE / --name=VALUE from argv; returns the value (True for flags) or None"""
+    """
+    ########
+    # take_option -> str, True, 또는 None
+    # argv에서 "--이름 값" 또는 "--이름=값"을 지우고 값을 돌려준다(has_value=False면 플래그로 보고 True).
+    # 값이 빠져 있으면 끝낸다.
+    ########
+    """
     for i, a in enumerate(argv):
         for name in names:
             if a == name:
@@ -998,6 +1457,12 @@ def take_option(argv, names, has_value=True):
 
 
 def peek_option(argv, names):
+    """
+    ########
+    # peek_option -> str 또는 None
+    # argv를 바꾸지 않고 "--이름 값", "--이름=값", "-f 값"의 값을 읽는다.
+    ########
+    """
     for i, a in enumerate(argv):
         for name in names:
             if a == name and i + 1 < len(argv):
@@ -1007,8 +1472,42 @@ def peek_option(argv, names):
     return None
 
 
+LONG_OPTIONS = ["foreground", "kid", "simulate", "sim-trace", "sim-dns", "sim-port", "sim-compare", "report",
+                "optimize", "help", "version", "binary", "sim-conf", "log-format", "convert"]
+
+
+def normalize_args(argv):
+    """
+    ########
+    # normalize_args -> list[str]
+    # squid의 getopt_long처럼 긴 옵션의 고유한 줄임(--simul -> --simulate)을 완전한 이름으로 펴고,
+    # 붙여 쓴 -f파일을 -f 파일로 나눈다. 그래야 squid-sim이 squid와 같은 값을 읽는다.
+    ########
+    """
+    result = []
+    for a in argv:
+        if a.startswith("--") and len(a) > 2:
+            name, eq, value = a[2:].partition("=")
+            matches = [o for o in LONG_OPTIONS if o.startswith(name)]
+            if name not in LONG_OPTIONS and len(matches) == 1:
+                a = "--" + matches[0] + eq + value
+        elif a.startswith("-f") and len(a) > 2:
+            result += ["-f", a[2:]]
+            continue
+        result.append(a)
+    return result
+
+
 def run_simulator(argv):
-    argv = list(argv)
+    """
+    ########
+    # run_simulator -> int (squid의 종료 코드)
+    # -m 없이 실행했을 때의 진입점. 인자를 정규화하고 squid-sim 전용 옵션(--binary, --sim-conf, --log-format, --convert)을 뺀다.
+    # squid.conf는 -f 또는 squid_conf, 로그는 --simulate 또는 access_log(없으면 squid.conf에서)로 정하고,
+    # --optimize만 있으면 로그 없이 실행한다. sim_port, sim_dns를 채우고 개인 임시 디렉터리에서 replay()한 뒤 지운다.
+    ########
+    """
+    argv = normalize_args(argv)
     binary = take_option(argv, ["--binary"])
     sim = SimConf(find_sim_conf(take_option(argv, ["--sim-conf"])))
     forced_format = take_option(argv, ["--log-format"])
@@ -1030,15 +1529,38 @@ def run_simulator(argv):
         if sim.get(key) and peek_option(argv, [option]) is None:
             argv += [option, sim.get(key)]
 
+    tmp = tempfile.mkdtemp(prefix="squid-sim-")
+    try:
+        return replay(argv, binary, sim, squid, log, convert_only, tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def replay(argv, binary, sim, squid, log, convert_only, tmp):
+    """
+    ########
+    # replay -> int (squid의 종료 코드, 신호로 끝나면 128+신호)
+    # 표준 입력 로그는 먼저 임시 파일로 받는다(형식 판별과 변환이 두 번 읽으므로). 형식을 정하고 알리며,
+    # %la나 시각이 없어 결과가 달라질 수 있으면 경고한다. --convert면 변환 결과만 출력한다.
+    # simulformat이 아니거나 gzip이면 임시 파일로 변환해 --simulate를 그 파일로 바꾼다.
+    # 패치한 squid를 자식 프로세스로 실행하고, 받은 SIGINT/SIGTERM/SIGHUP을 자식에게 넘겨 임시 파일이 남지 않게 한다.
+    ########
+    """
+    shown = log
+    if log == "-":
+        log = os.path.join(tmp, "stdin.log")
+        with open(log, "wb") as out:
+            shutil.copyfileobj(sys.stdin.buffer, out)
+        set_simulate(argv, log)
     fmt = None
     if log:
-        if log != "-" and not os.path.isfile(log):
+        if not os.path.isfile(log):
             sys.exit("squid-sim: cannot open %s" % log)
         fmt, how = choose_format(log, sim, squid)
         if fmt.missing:
             sys.exit("squid-sim: logformat %s has no %s; the simulator needs the client address and URL"
                      % (fmt.name, " or ".join(fmt.missing)))
-        print("squid-sim: %s is logformat %s (%s)" % (log, fmt.name, how), file=sys.stderr)
+        print("squid-sim: %s is logformat %s (%s)" % (shown, fmt.name, how), file=sys.stderr)
         if not fmt.has_local_ip and squid.uses_local_ip and fmt.local_ip == "-":
             print("squid-sim: warning: the log has no %la and squid.conf uses localip/myip ACLs; "
                   "set local_ip in squid-sim.conf", file=sys.stderr)
@@ -1046,41 +1568,67 @@ def run_simulator(argv):
             print("squid-sim: warning: the log has no time; time ACLs use the current time", file=sys.stderr)
 
     if convert_only:
-        converted, unmatched = convert_log(convert_only, fmt, sys.stdout)
+        sys.stdout.flush()
+        out = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="surrogateescape", newline="\n")
+        converted, unmatched = convert_log(log, fmt, out)
+        out.flush()
+        out.detach()
         print("squid-sim: %d lines converted, %d did not match" % (converted, unmatched), file=sys.stderr)
         return 0
 
     binary = find_binary(binary)
     if not binary or not os.access(binary, os.X_OK):
         sys.exit("squid-sim: patched squid not found; run scripts/build.sh or pass --binary PATH")
-    sys.stdout.flush()
-    sys.stderr.flush()  # block-buffered when redirected on Python < 3.9; exec would drop it
-    if not fmt or (fmt.passthrough and log != "-" and not log.endswith(".gz")):
-        os.execv(binary, [binary] + argv)
-
-    # other formats: replay a simulformat copy (named like the original, in a private temp directory)
-    tmp = tempfile.mkdtemp(prefix="squid-sim-")
-    try:
-        name = "stdin.log" if log == "-" else re.sub(r"\.gz$", "", os.path.basename(log))
-        copy = os.path.join(tmp, name)
-        with open(copy, "w", encoding="utf-8") as out:
+    if fmt and not (fmt.passthrough and not log.endswith(".gz")):
+        name = "stdin.log" if shown == "-" else re.sub(r"\.gz$", "", os.path.basename(log))
+        copy = os.path.join(tmp, "simulformat-" + name)
+        with open(copy, "w", encoding="utf-8", errors="surrogateescape", newline="\n") as out:
             converted, unmatched = convert_log(log, fmt, out)
         print("squid-sim: converted %d lines to simulformat (%d did not match and are reported as skipped)"
               % (converted, unmatched), file=sys.stderr)
-        for i, a in enumerate(argv):
-            if a == "--simulate":
-                argv[i + 1] = copy
-            elif a.startswith("--simulate="):
-                argv[i] = "--simulate=" + copy
-        sys.stderr.flush()
-        return subprocess.call([binary] + argv)
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        set_simulate(argv, copy)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    child = subprocess.Popen([binary] + argv)
+
+    def forward(signum, frame):
+        """
+        ########
+        # forward -> None
+        # 받은 신호를 squid 자식 프로세스에 그대로 보낸다.
+        ########
+        """
+        child.send_signal(signum)
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, forward)
+    status = child.wait()
+    return status if status >= 0 else 128 - status
 
 
-# ---------------------------------------------------------------- main
+def set_simulate(argv, path):
+    """
+    ########
+    # set_simulate -> None (argv 변경)
+    # argv의 --simulate 값을 주어진 경로로 바꾼다("--simulate 값", "--simulate=값" 모두).
+    ########
+    """
+    for i, a in enumerate(argv):
+        if a == "--simulate" and i + 1 < len(argv):
+            argv[i + 1] = path
+        elif a.startswith("--simulate="):
+            argv[i] = "--simulate=" + path
+
 
 def main():
+    """
+    ########
+    # main -> int (종료 코드)
+    # -m/--manager가 없으면 시뮬레이터(run_simulator)로, -h/--help면 사용법을 출력한다.
+    # 매니저 모드: squid-sim.conf를 읽고 옵션을 해석해 주소(--url, manager_url, http_port 순)와 비밀번호 환경 변수를 정한다.
+    # 상태를 바꾸는 페이지(shutdown 등)는 거부한다. --raw면 원문, --report가 없으면 한 번 조회해 요약,
+    # 있으면 counters를 맨 앞에 두고 기록한 뒤 summary.txt와 report.html을 쓴다.
+    ########
+    """
     argv = sys.argv[1:]
     if not any(a in ("--manager", "-m") for a in argv):
         if argv and argv[0] in ("-h", "--help"):
@@ -1131,7 +1679,7 @@ def main():
                     sys.exit("squid-sim: %s/%s: %s" % (mgr.base, page, e))
             return 0
         errors = []
-        snap = filter_snapshot(take_snapshot(mgr, pages, errors), args.include_local)
+        snap = filter_snapshot(take_snapshot(mgr, pages, errors), args.include_local, mgr.own_addr)
         print_snapshot(snap, mgr.base)
         for err in errors:
             print("error: " + err, file=sys.stderr)
@@ -1141,7 +1689,7 @@ def main():
         if page not in pages:
             pages.insert(0, page)
     pages.remove("counters")
-    pages.insert(0, "counters")  # first, so the subtraction of our own requests lines up
+    pages.insert(0, "counters")
     out_dir = args.out or "manager-report-" + time.strftime("%Y%m%d-%H%M%S")
     print("recording %s every %s from %s into %s (Ctrl-C stops early)" % (
         fmt_duration(args.report), fmt_duration(args.interval), mgr.base, out_dir), file=sys.stderr)
