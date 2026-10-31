@@ -1,0 +1,14 @@
+# The requests of access.log in squid's predefined "squid" format (no %la; %ts is UTC).
+# tests/sim-squid.conf supplies the proxy address and the +0900 offset.
+1793581200.000    120 10.0.0.5 TCP_MISS/200 1024 GET http://www.example.com/ - HIER_DIRECT/93.184.216.34 text/html
+1793581201.000      0 10.0.0.5 TCP_DENIED/403 3500 GET http://x.ads.example.com/a.js - HIER_NONE/- text/html
+1793581202.000      0 10.0.0.5 TCP_DENIED/403 3500 GET http://www.example.com:8080/ - HIER_NONE/- text/html
+1793581203.000   5012 10.0.0.5 TCP_TUNNEL/200 5000 CONNECT www.example.com:443 - HIER_DIRECT/93.184.216.34 -
+1793581204.000      0 10.0.0.5 TCP_DENIED/403 3500 CONNECT www.example.com:8443 - HIER_NONE/- text/html
+1793581205.000      0 10.0.0.5 TCP_DENIED/403 3500 GET http://www.facebook.com/ - HIER_NONE/- text/html
+1793408406.000     98 10.0.0.5 TCP_MISS/200 2048 GET http://www.facebook.com/ - HIER_DIRECT/157.240.1.35 text/html
+1793581207.000      0 192.168.1.10 TCP_DENIED/403 3500 GET http://www.example.com/ - HIER_NONE/- text/html
+this line is not an access.log line
+1793581209.000      0 10.0.0.5 NONE_NONE/400 4000 NONE error:invalid-request - HIER_NONE/- text/html
+1793581210.000     77 10.0.0.5 TCP_MISS/200 1024 GET http://y.ads.example.com/ - HIER_DIRECT/203.0.113.7 text/html
+1793581211.000     65 10.20.30.40 TCP_MISS/200 1024 GET https://www.dup.example/ - HIER_DIRECT/203.0.113.8 text/html

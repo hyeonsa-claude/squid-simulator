@@ -11,7 +11,7 @@ localhost처럼 의미 없는 항목은 빼고 보여줍니다. squid에는 읽�
 |---|---|
 | 실행 위치 | squid와 같은 서버 (매니저는 기본적으로 localhost에서만 허용) |
 | squid.conf | `http_access allow localhost manager` (Ubuntu 기본 설정에 이미 있음) |
-| 주소 | 기본은 `/etc/squid/squid.conf`의 첫 `http_port`. 다르면 `--url http://127.0.0.1:8090` |
+| 주소 | 기본은 `/etc/squid/squid.conf`의 첫 `http_port`. 다르면 `--url http://127.0.0.1:8090`, 또는 [squid-sim.conf](LOGFORMAT.md)의 `manager_url`에 적어 둠 |
 | 비밀번호 | `cachemgr_passwd`를 쓰면 환경 변수에 넣고 `--password-env 변수명` (명령줄에 비밀번호를 쓰지 않음) |
 | 필요한 것 | Python 3.8 이상 (표준 라이브러리만 사용). 패치한 squid 빌드는 필요 없음 |
 
@@ -31,14 +31,14 @@ SQUID_MGR_PW='…' scripts/squid-sim -m --password-env SQUID_MGR_PW --report 60m
 |---|---|---|
 | `--manager`, `-m` | | 매니저 모드 (없으면 나머지 인자를 패치한 squid로 넘겨 시뮬레이터 실행) |
 | `--url` | `--conf`의 첫 `http_port` | squid 주소 |
-| `--conf` | `/etc/squid/squid.conf` | `--url`을 추측할 설정 파일 |
+| `--conf` | squid-sim.conf의 `squid_conf` (기본 `/etc/squid/squid.conf`) | `--url`을 추측할 설정 파일 |
 | `--page` | info, counters, client_list, ipcache, fqdncache, active_requests | 볼 페이지 (쉼표로 여러 개) |
 | `--raw` | | 필터 없이 원문 출력 |
 | `--report` | | 기록 시간. `60m`, `1h`, `30s`, `1h30m`, 숫자만 쓰면 분 |
 | `--interval` | `60s` | 기록 중 조회 간격 |
 | `--out` | `./manager-report-YYYYmmdd-HHMMSS` | 리포트 폴더 |
 | `--include-local` | | 아래의 제외 규칙을 끔 |
-| `--password-env` | | `cachemgr_passwd` 비밀번호가 든 환경 변수 이름 |
+| `--password-env` | squid-sim.conf의 `manager_password_env` | `cachemgr_passwd` 비밀번호가 든 환경 변수 이름 |
 
 기록은 Ctrl-C로 일찍 끝낼 수 있고, 그때까지 모은 데이터로 리포트를 씁니다. 조회 결과는 매번 `snapshots.jsonl`에
 바로 저장되므로 중간에 끊겨도 데이터가 남습니다.

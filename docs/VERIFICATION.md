@@ -1,7 +1,7 @@
 # 검증 결과 (ubuntu-26.04-squid-7.7: Ubuntu 26.04 / squid 7.7)
 
 2026-10-31 기준, squid 7.7 이식 패치는 **Ubuntu 26.04.1 LTS 실기**에서 `scripts/verify-target.sh` 전체를 통과했습니다.
-빌드, Squid 7.7 자체 단위 테스트, 기능 테스트 32개, 배포판 squid 7.7과의 `-k parse` 비교가 모두 통과입니다.
+빌드, Squid 7.7 자체 단위 테스트, 기능 테스트 37개, 배포판 squid 7.7과의 `-k parse` 비교가 모두 통과입니다.
 
 ## 2단계: Ubuntu 26.04 실기 검증 (완료)
 
@@ -18,7 +18,8 @@
 | 소스·패치 | 업스트림 tarball SHA-256 일치, Ubuntu 패치 4개와 시뮬레이터 패치 충돌 없음 |
 | 빌드 | 성공, squid 7.7 기본 플래그(`-Wall -Wextra -Wshadow -Wmissing-declarations -Werror`) 경고 0 |
 | `make check` | 테스트 프로그램 103개 PASS, FAIL 0, ERROR 0 |
-| 기능 테스트 | 32개 모두 통과 (공통 28개 + 7.x 전용 최적화 검사 4개) |
+| 기능 테스트 | 37개 모두 통과 (공통 33개 + 7.x 전용 최적화 검사 4개). 공통 33개에는 로그 형식 변환 검사 5개(`squid` 형식 자동 판별, gzip, squid-sim.conf에 정의한 형식)가 포함 |
+| 실제 로그 | 기본 설정 squid의 `squid` 형식 access.log 176줄을 설정 파일 없이 `sudo scripts/squid-sim`으로 자동 판별·재생, 실제 로그와 다른 판정 0건 |
 | `-k parse` 비교 | `tests/squid.conf`, `tests/squid-new.conf`, `/etc/squid/squid.conf` 모두 배포판 squid와 같은 결과(0) |
 | 기본 설정 최적화 | 배포판 `/etc/squid/squid.conf`의 `localnet`을 "사용하지 않는 ACL"로 보고. 기본 설정은 `http_access allow localnet`이 주석 처리되어 있어 정확한 결과 |
 
@@ -73,7 +74,7 @@ squid 7의 워커별 출력(`by kid1 { … } by kid1`)도 squid 4.10과 같은 �
 | 패치 적용 (Ubuntu 패치 4개 다음) | 17개 파일, 충돌 없음 |
 | 빌드 | 첫 빌드에서 7.7에서 쓰지 않게 된 함수 1개가 `-Werror` 오류. 제거 후 성공 |
 | Squid 단위 테스트 `make check` | 테스트 프로그램 103개 PASS, FAIL 0, ERROR 0 |
-| 기능 테스트 `scripts/test.sh` | 공통 28개 검사 모두 통과. squid 4.10 브랜치와 같은 결과 |
+| 기능 테스트 `scripts/test.sh` | 공통 검사 모두 통과. squid 4.10 브랜치와 같은 결과 |
 | 패치 재현성 | 저장소의 패치를 새로 적용한 소스가 테스트한 소스와 17개 파일 모두 동일 |
 
 ## 재현 방법

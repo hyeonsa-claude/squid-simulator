@@ -31,8 +31,10 @@ echo "[simulate] verdicts and deciding rules"
 "$SQUID" -f "$T/squid.conf" --simulate "$T/access.log" > "$OUT/simulate.txt" 2> "$OUT/simulate.err"
 echo "  exit $?"
 # first line of every record: "<line>  <VERDICT>  <rule> ... (log X/Y: <vs>)"
-awk '$1 ~ /^[0-9]+$/ { vs = "*"; if (match($0, /: [A-Za-z\/]+\)$/)) vs = substr($0, RSTART + 2, RLENGTH - 3); print $1, $2, $3, vs }' \
-    "$OUT/simulate.txt" > "$OUT/simulate.got"
+verdicts() {
+    awk '$1 ~ /^[0-9]+$/ { vs = "*"; if (match($0, /: [A-Za-z\/]+\)$/)) vs = substr($0, RSTART + 2, RLENGTH - 3); print $1, $2, $3, vs }' "$1"
+}
+verdicts "$OUT/simulate.txt" > "$OUT/simulate.got"
 while read -r line verdict rule vs; do
     case "$line" in ''|\#*) continue ;; esac
     got=$(awk -v l="$line" '$1 == l' "$OUT/simulate.got")
@@ -84,6 +86,32 @@ echo "[report] --report"
 for needle in "<title>Squid ACL Simulation</title>" "Changes: current" "Optimization" "Denied requests by rule" "</html>"; do
     grep -qF "$needle" "$OUT/report.html" 2>/dev/null && pass "report has '$needle'" || fail "report lacks '$needle'"
 done
+
+# 6. other log formats: squid-sim converts them as squid-sim.conf says; verdicts must not change
+echo "[logformat] scripts/squid-sim with squid-sim.conf"
+SIM="$ROOT/scripts/squid-sim"
+same_verdicts() {
+    verdicts "$OUT/$1.txt" > "$OUT/$1.got"
+    if [ -s "$OUT/$1.got" ] && diff -u "$OUT/simulate.got" "$OUT/$1.got" > "$OUT/$1.diff"; then
+        pass "$2"
+    else
+        fail "$2 (see $OUT/$1.err)"; sed 's/^/        /' "$OUT/$1.diff"
+    fi
+}
+"$SIM" --binary "$SQUID" --sim-conf /dev/null -f "$T/squid.conf" --simulate "$T/access.log" \
+    > "$OUT/fmt-simul.txt" 2> "$OUT/fmt-simul.err"
+same_verdicts fmt-simul "simulformat log is passed to squid unchanged"
+# squid_conf and access_log come from the conf; the format is detected
+"$SIM" --binary "$SQUID" --sim-conf "$T/sim-squid.conf" > "$OUT/fmt-squid.txt" 2> "$OUT/fmt-squid.err"
+same_verdicts fmt-squid "predefined 'squid' format detected (%ts in UTC, local_ip, log_timezone)"
+grep -q "logformat squid (detected" "$OUT/fmt-squid.err" \
+    && pass "detection is reported" || fail "no 'logformat squid (detected' in $OUT/fmt-squid.err"
+gzip -c "$T/access-squid.log" > "$OUT/access-squid.log.gz"
+"$SIM" --binary "$SQUID" --sim-conf "$T/sim-squid.conf" --simulate "$OUT/access-squid.log.gz" \
+    > "$OUT/fmt-gz.txt" 2> "$OUT/fmt-gz.err"
+same_verdicts fmt-gz "gzip-compressed log"
+"$SIM" --binary "$SQUID" --sim-conf "$T/sim-custom.conf" > "$OUT/fmt-custom.txt" 2> "$OUT/fmt-custom.err"
+same_verdicts fmt-custom "logformat defined in squid-sim.conf (%tg, quoted fields, extra codes)"
 
 echo
 echo "outputs: $OUT"

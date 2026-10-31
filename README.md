@@ -12,8 +12,9 @@ Squid 소스에 패치로 붙어서, 판정은 Squid 자신의 설정 파서와 
 | 리포트 | `--report out.html` | 위 결과 전체를 담은 HTML 한 파일 (검색·필터, 규칙별 평가 과정) |
 | 캐시 매니저 | `squid-sim -m [--report 60m]` | 실행 중인 squid의 클라이언트, DNS 조회·실패, 진행 중 요청, 분당 요청을 localhost 같은 잡음 없이 조회하거나 기록 |
 
-모든 기능은 `scripts/squid-sim` 하나로 실행합니다. `-m`이 없으면 인자를 패치한 squid로 그대로 넘기고, `-m`이 있으면
-실행 중인 squid의 캐시 매니저(`/squid-internal-mgr/`)를 읽습니다.
+모든 기능은 `scripts/squid-sim` 하나로 실행합니다. `-m`이 없으면 인자를 패치한 squid로 넘기고, `-m`이 있으면
+실행 중인 squid의 캐시 매니저(`/squid-internal-mgr/`)를 읽습니다. 사이트마다 다른 로그 형식, 대상 squid.conf와
+로그 경로는 시뮬레이터 전용 설정 파일 [`squid-sim.conf`](squid-sim.conf)에서 관리합니다.
 
 ## 브랜치
 
@@ -21,20 +22,29 @@ Squid 내부 API는 메이저 버전마다 달라서, 배포판의 squid 버전�
 
 | 브랜치 | 대상 OS | squid | 검증 |
 |---|---|---|---|
-| `main` | Ubuntu 20.04 LTS | 4.10 | Ubuntu 20.04.6에서 빌드·`make check` 94 PASS·기능 테스트 28개·배포판 squid 비교 통과 |
-| [`ubuntu-26.04-squid-7.7`](https://github.com/hyeonsa-claude/squid-simulator/tree/ubuntu-26.04-squid-7.7) | Ubuntu 26.04 LTS | 7.7 | Ubuntu 26.04.1에서 빌드·`make check` 103 PASS·기능 테스트 32개·배포판 squid 비교 통과 |
+| `main` | Ubuntu 20.04 LTS | 4.10 | Ubuntu 20.04.6에서 빌드·`make check` 94 PASS·기능 테스트 33개·배포판 squid 비교 통과 |
+| [`ubuntu-26.04-squid-7.7`](https://github.com/hyeonsa-claude/squid-simulator/tree/ubuntu-26.04-squid-7.7) | Ubuntu 26.04 LTS | 7.7 | Ubuntu 26.04.1에서 빌드·`make check` 103 PASS·기능 테스트 37개·배포판 squid 비교 통과 |
 
 ## 빠른 시작
 
-### 1. 로그 형식 준비
+### 1. 로그 형식 (squid-sim.conf)
 
-운영 squid.conf에 `simulformat` 형식을 정의하고 access.log에 적용합니다.
-시뮬레이터는 필드를 위치로 읽으므로 이름은 바꿔도 되지만, 필드 순서는 그대로여야 합니다.
+운영 squid.conf의 로그 설정은 바꾸지 않아도 됩니다. `scripts/squid-sim`이 로그 형식을 정해 시뮬레이터가 읽는
+`simulformat`으로 바꿔 넣습니다. 형식은 시뮬레이터 전용 설정 파일 `squid-sim.conf`가 정하며, 기본값 `auto`는
+squid.conf의 `access_log`가 쓰는 형식과 미리 정의된 형식(`squid`, `common`, `combined` 등)을 로그에 맞춰 보고 고릅니다.
+직접 정의한 형식은 squid.conf의 `logformat` 줄을 복사해 넣습니다 (`/etc/squid/squid-sim.conf`):
 
 ```
-logformat simulformat %tl %la %>a  "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh
-access_log daemon:/var/log/squid/access.log simulformat
+squid_conf    /etc/squid/squid.conf
+access_log    /var/log/squid/access.log
+logformat     site %>a %la [%tg] %Ss/%03>Hs %<st "%rm %ru" %tr "%{User-Agent}>h" %un
+log_format    site
+log_timezone  +0900       # %tg, %ts는 UTC라서 프록시 타임존이 필요
 ```
+
+`%>a`와 `%ru`만 있으면 되고, `%tl`, `%la`, `%rm`, `%Ss`가 있으면 시각 ACL, `localip`, 메서드, 실제 로그와의 비교까지 정확해집니다.
+가장 정확한 형식은 이 필드를 모두 담은 `simulformat`입니다:
+`logformat simulformat %tl %la %>a  "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh`. 자세한 내용은 [docs/LOGFORMAT.md](docs/LOGFORMAT.md)에 있습니다.
 
 ### 2. 빌드
 
@@ -51,7 +61,9 @@ scripts/build.sh --deps        # 빌드 패키지 설치(sudo) → 공식 소스
 
 ```bash
 S=scripts/squid-sim          # build/squid-7.7/src/squid를 찾아 실행
+sudo $S                                                                     # squid-sim.conf의 squid.conf + access.log
 $S -f /etc/squid/squid.conf --simulate /var/log/squid/access.log            # 요청별 판정
+$S --simulate access.log.2.gz --report old.html                             # 다른 형식·gzip 로그도 그대로
 $S -f /etc/squid/squid.conf --simulate access.log --sim-compare new.conf    # 설정 비교
 $S -f /etc/squid/squid.conf --optimize                                      # 최적화 항목
 $S -f /etc/squid/squid.conf --simulate access.log --sim-compare new.conf \
@@ -261,6 +273,7 @@ Squid는 첫 매칭에서 멈추므로, 뒤에서 허용했을 규칙을 알려�
 - [docs/USAGE.md](docs/USAGE.md): 로그 준비, 옵션, 출력 읽는 법, 최적화 항목 전체
 - [docs/MANAGER.md](docs/MANAGER.md): 캐시 매니저 조회·기록, 제외 규칙, 리포트 읽는 법
 - [docs/DESIGN.md](docs/DESIGN.md): 구조, 핵심 메커니즘, 소스 수정 내역
+- [docs/LOGFORMAT.md](docs/LOGFORMAT.md): squid-sim.conf, 로그 형식 자동 판별과 변환, 형식별 정확도
 - [docs/VERIFICATION.md](docs/VERIFICATION.md): Ubuntu 26.04 실기 검증 결과
 - [docs/PORTING-7.7.md](docs/PORTING-7.7.md): squid 4.10 → 7.7 이식 내역
 
@@ -268,13 +281,14 @@ Squid는 첫 매칭에서 멈추므로, 뒤에서 허용했을 규칙을 알려�
 
 ```
 patches/squid-7.7-acl-simulator.patch    Squid 소스에 적용하는 패치 (patch -p1)
-scripts/squid-sim                        모든 기능의 실행 진입점 (시뮬레이터 실행, 캐시 매니저 조회·기록)
+squid-sim.conf                           시뮬레이터 설정 예시 (대상 squid.conf, 로그 경로, 로그 형식)
+scripts/squid-sim                        모든 기능의 실행 진입점 (로그 형식 변환, 시뮬레이터 실행, 캐시 매니저)
 scripts/target.env                       이 브랜치의 대상 OS, squid 버전, 체크섬, configure 옵션
 scripts/build.sh                         다운로드 → SHA-256 확인 → 패치 → configure → make [--check]
 scripts/test.sh                          tests/의 설정·로그로 기능 테스트
 scripts/verify-target.sh                 대상 OS에서 전체 검증 (빌드 + make check + 기능 테스트 + 배포판 비교
                                          + 실행 중인 squid 무영향 + 캐시 매니저)
-tests/                                   테스트용 squid.conf, 비교용 conf, access.log, squid 7 전용 최적화 설정, 기대 결과
+tests/                                   테스트용 squid.conf, 비교용 conf, 형식별 access.log와 squid-sim.conf, squid 7 전용 최적화 설정, 기대 결과
 docs/                                    문서
 ```
 

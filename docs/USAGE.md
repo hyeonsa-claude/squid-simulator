@@ -7,8 +7,10 @@
 
 ## 로그 준비
 
-운영 squid.conf에 아래 형식을 정의하고 access.log에 적용합니다. 시뮬레이터는 필드를 **위치로** 읽으므로
-형식 이름(`simulformat`)은 바꿔도 되지만, 필드 순서는 그대로여야 합니다.
+squid 바이너리(`--simulate`)는 아래 `simulformat` 한 가지를 필드 **위치로** 읽습니다. `scripts/squid-sim`으로 실행하면
+다른 형식(squid 기본 `squid` 형식, `combined`, 사이트별 `logformat`, `.gz`)도 시뮬레이터 설정 파일 `squid-sim.conf`에 따라
+판별·변환해 넣으므로, 운영 squid.conf를 바꿀 필요는 없습니다. 형식 정의와 판별 규칙은 [LOGFORMAT.md](LOGFORMAT.md)에 있습니다.
+아래 형식은 시뮬레이터가 쓰는 필드를 모두 담고 있어 가장 정확합니다.
 
 ```
 logformat simulformat %tl %la %>a  "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh
