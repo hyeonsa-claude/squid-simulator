@@ -12,23 +12,22 @@ Squid 내부 API가 버전마다 달라서, 배포판의 squid 버전마다 브�
 | 브랜치 | 대상 OS | squid | 상태 |
 |---|---|---|---|
 | `main` | Ubuntu 20.04 LTS | 4.10 | 빌드·`make check`·기능 테스트 통과 ([docs/VERIFICATION.md](docs/VERIFICATION.md)) |
-| `ubuntu-26.04-squid-7.7` | Ubuntu 26.04 LTS | 7.7 (26.04 업데이트 기준, 출시 시 7.2) | 이식 완료. 20.04에서 7.7 빌드·`make check`·기능 테스트 통과, 26.04 머신 검증 대기 |
+| `ubuntu-26.04-squid-7.7` | Ubuntu 26.04 LTS | 7.7 (26.04 업데이트 기준, 출시 시 7.2) | 이식 완료. 20.04에서 7.7 빌드·`make check`·기능 테스트 통과, 26.04 머신 검증 대기 ([docs/VERIFICATION.md](docs/VERIFICATION.md)) |
 
-## 빠른 시작 (Ubuntu 20.04)
+## 빠른 시작 (이 브랜치: Ubuntu 26.04 / squid 7.7)
 
 ```bash
-git clone https://github.com/hyeonsa-claude/squid-simulator.git
+git clone -b ubuntu-26.04-squid-7.7 https://github.com/hyeonsa-claude/squid-simulator.git
 cd squid-simulator
-scripts/build.sh --deps          # 빌드 패키지 설치(sudo) → 소스 다운로드·검증 → 패치 → 빌드
-scripts/test.sh                  # 시뮬레이터 기능 테스트
+scripts/verify-target.sh         # 패키지 설치(sudo) → 빌드 + make check → 기능 테스트 → 배포판 squid와 비교
 ```
 
-한 번에 전부 검증하려면 `scripts/verify-target.sh` (OS·버전 확인 → 빌드 + `make check` → 기능 테스트 → 배포판 squid와 비교).
-
-`build/squid-4.10/src/squid`가 패치된 바이너리입니다. 설치는 하지 않습니다.
+빌드만 하려면 `scripts/build.sh --deps`, 기능 테스트만 하려면 `scripts/test.sh`.
+이 브랜치는 업스트림 squid 7.7에 Ubuntu 패키지의 자체 패치 4개를 먼저 적용한 뒤 시뮬레이터 패치를 적용합니다.
+`build/squid-7.7/src/squid`가 패치된 바이너리입니다. 설치는 하지 않습니다.
 
 ```bash
-B=build/squid-4.10/src/squid
+B=build/squid-7.7/src/squid
 $B -f /etc/squid/squid.conf --simulate /var/log/squid/access.log                 # 요청별 판정
 $B -f /etc/squid/squid.conf --simulate access.log --sim-compare new.conf         # 설정 비교
 $B -f /etc/squid/squid.conf --optimize                                           # 불필요한 ACL·규칙
@@ -43,6 +42,7 @@ $B -f /etc/squid/squid.conf --simulate access.log --sim-compare new.conf \
 - [docs/USAGE.md](docs/USAGE.md): 옵션, 출력 읽는 법, 최적화 항목
 - [docs/DESIGN.md](docs/DESIGN.md): 구조, 핵심 메커니즘, 소스 수정 내역
 - [docs/VERIFICATION.md](docs/VERIFICATION.md): 검증 방법과 결과, 한계
+- [docs/PORTING-7.7.md](docs/PORTING-7.7.md): squid 4.10 → 7.7 이식 내역
 
 ## 구성
 

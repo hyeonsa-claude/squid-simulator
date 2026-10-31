@@ -1,62 +1,49 @@
-# 검증 결과 (main: Ubuntu 20.04 / squid 4.10)
+# 검증 결과 (ubuntu-26.04-squid-7.7: Ubuntu 26.04 / squid 7.7)
 
-2026-10-31 기준, 이 브랜치의 패치는 공식 squid 4.10 릴리스에서 `-Werror` 빌드, Squid 자체 단위 테스트, 시뮬레이터 기능 테스트를 모두 통과했습니다.
+2026-10-31 기준, squid 7.7 이식 패치는 빌드, Squid 7.7 자체 단위 테스트, 시뮬레이터 기능 테스트를 모두 통과했습니다.
+다만 아직 **Ubuntu 20.04 서버에서 7.7을 빌드해 확인한 결과**이고, 26.04 머신에서는 아직 확인하지 않았습니다.
 
-## 환경
+## 1단계: Ubuntu 20.04에서 7.7 이식 확인 (완료)
 
 | 항목 | 값 |
 |---|---|
-| OS | Ubuntu 20.04.6 LTS (커널 5.4.0-216), 4코어, 메모리 3 GB |
-| 배포판 squid | 4.10 (Ubuntu 패키지, 실행 중인 서비스는 건드리지 않음) |
-| 컴파일러 | g++ 9.4.0 |
-| 소스 | `squid-4.10.tar.gz` (SHA-256 `df0685e8…a1c8f`) |
-| configure | Ubuntu 패키지의 핵심 옵션 (`scripts/target.env`), Squid 기본값인 `-Wall -Wshadow -Werror` |
+| OS | Ubuntu 20.04.6 LTS, 4코어, 메모리 3 GB |
+| 컴파일러 | g++ 9.4.0, `-std=c++17` |
+| 소스 | `squid-7.7.tar.xz` (SHA-256 `e3bd613b…5da9b`, Ubuntu `squid_7.7.orig.tar.xz`와 동일) |
+| Ubuntu 패치 | `7.7-0ubuntu0.26.04.1`의 0001, 0006, 90, 99 적용 |
+| 경고 플래그 | squid 7.7 기본값 `-Wall -Wextra -Wimplicit-fallthrough=5 -Wshadow -Wmissing-declarations -Werror` |
 
-## 결과
+| 단계 | 결과 |
+|---|---|
+| 패치 적용 (Ubuntu 패치 4개 다음) | 17개 파일, 충돌 없음 |
+| 빌드 | 첫 빌드에서 7.7에서 쓰지 않게 된 함수 1개가 `-Werror` 오류. 제거 후 성공 |
+| Squid 단위 테스트 `make check` | 테스트 프로그램 103개 PASS, FAIL 0, ERROR 0 |
+| 기능 테스트 `scripts/test.sh` | 28개 검사 모두 통과. squid 4.10 브랜치와 같은 결과 |
+| 패치 재현성 | 저장소의 패치를 새로 적용한 소스가 테스트한 소스와 17개 파일 모두 동일 |
 
-| 단계 | 명령 | 결과 |
-|---|---|---|
-| 패치 적용 | `patch -p1` (공식 tarball) | 18개 파일, 오프셋·퍼지 없이 적용 |
-| 빌드 | `scripts/build.sh` | 성공, 경고 0 (`-Werror`) |
-| Squid 단위 테스트 | `make check` | 테스트 프로그램 94개 PASS, FAIL 0, ERROR 0 (헤더 단독 컴파일 테스트 포함) |
-| 설정 파싱 | `squid -k parse` | 패치 전과 같이 성공 |
-| 요청별 판정 | `scripts/test.sh` [simulate] | 12줄 모두 기대한 판정·판정 규칙·로그 비교 결과 |
-| 매칭 규칙 목록 | 〃 | 차단 요청에서 뒤의 allow 규칙까지 표시 |
-| 설정 비교 | 〃 [compare] | 기대한 3줄(판정 변경 2, 규칙만 변경 1)만 변경으로 보고 |
-| 최적화 | 〃 [optimize] | 기대한 8개 항목 모두 보고 |
-| HTML 리포트 | 〃 [report] | 필수 섹션 모두 포함 |
+## 2단계: Ubuntu 26.04 머신에서 확인 (대기)
 
-`scripts/test.sh`의 28개 검사가 모두 통과했습니다. 테스트 로그는 시간 ACL(`02/Nov/2026` 월요일 10:00 +0900과
-`31/Oct/2026` 토요일), CONNECT, 비표준 포트, 헤더가 필요한 ACL(UNSURE), 파싱 불가 줄, 로그와 다른 판정(DIFF)을 포함합니다.
-테스트 서버의 타임존은 UTC여서, 시간 ACL 테스트는 로그의 +0900 오프셋을 따르는지도 함께 확인합니다.
-
-## 검증 중 발견해 고친 결함
-
-| 발견 단계 | 결함 | 수정 |
-|---|---|---|
-| 코드 검토 | `.h` 파일이 `make check` 헤더 테스트에서 `-Werror` 실패 | `AclSimulator.cci`로 변경 |
-| 코드 검토 | `external` ACL이 초기화 안 된 helper를 역참조해 크래시 | `external_acl.cc`에 NULL 검사 |
-| 코드 검토 | 파싱 노트가 항상 기록되어 운영 squid의 reconfigure마다 메모리 증가 | `--simulate`/`--optimize`에서만 기록 |
-| 코드 검토 | 그 밖의 판정·분석 로직 10건 (UNSURE 범위, AUTH 집계, 보편 ACL 오판 등) | 수정 |
-| 실행 테스트 | 시뮬레이터 실행 머신에 `mime.conf` 등 설정이 가리키는 파일이 없으면 FATAL 종료 | `-k parse`처럼 경고만 하도록 `opt_simulate` 추가 |
-| 실행 테스트 | 기록되는 debug 메시지가 `squid_curtime`을 현재 시각으로 되돌려 `acl time` 재생이 틀릴 수 있음 | 매 판정 직전에 로그 시각 재설정 |
-| 실행 테스트 | `deny all` 뒤의 마지막 규칙에 "기본값을 정하므로 유지하라"는 잘못된 권고 | 앞에 무조건 규칙이 있으면 기본값이 쓰이지 않으므로 일반 중복으로 보고 |
-
-## 재현 방법
+26.04 머신에서 다음 한 줄로 전체를 확인합니다.
 
 ```bash
-scripts/verify-target.sh        # OS·버전 확인 → 빌드 + make check → 기능 테스트 → 배포판 squid와 -k parse 비교
+git clone -b ubuntu-26.04-squid-7.7 https://github.com/hyeonsa-claude/squid-simulator.git
+cd squid-simulator && scripts/verify-target.sh
 ```
+
+이 스크립트가 확인하는 것:
+
+1. OS가 Ubuntu 26.04이고, 설치된 squid가 7.7인지 (`apt-get install squid` 후 `apt-get upgrade`로 7.7)
+2. 26.04의 빌드 의존 패키지로 빌드 + `make check` (26.04의 g++과 라이브러리 버전)
+3. 기능 테스트 28개
+4. 배포판 squid 7.7과 패치한 squid 7.7이 테스트 설정과 `/etc/squid/squid.conf`에 같은 `-k parse` 결과를 내는지
+
+추가로 확인할 것:
+
+- `src all`의 `dump()` 출력 형식 (모든 요청에 매칭되는 ACL 판단). 1단계 테스트에서는 `all`을 이름으로 판단해 통과
+- 7.7에서 새로 생긴 "겹치는 항목 병합" 경고가 `overlapping entries`로 보고되는지
 
 ## 한계
 
-| 종류 | 해당 ACL | 시뮬레이터 표시 |
-|---|---|---|
-| 로그에 없는 요청 헤더 | `browser`, `referer_regex`, `req_header`, `req_mime_type` | UNSURE |
-| 사용자 인증 | `proxy_auth`, `proxy_auth_regex`, `max_user_ip` | AUTH, UNSURE |
-| helper·연결 상태 | `external`, `ident`, `maxconn`, `note`, `tag` 등 | UNSURE |
-| DNS | `dst`, `srcdomain`, IP URL의 `dstdomain` | `--sim-dns off`: UNSURE, `system`: 현재 DNS 결과 |
-| 다른 지시어 | `miss_access`, `adapted_http_access`, `ssl_bump`, `http_reply_access` | 대상 아님. 로그의 `TCP_DENIED`가 여기서 왔다면 DIFF |
-
-- 최적화의 도달 불가·중복 규칙 판단은 ACL 이름 집합 기준입니다. 서로 다른 ACL의 값이 겹치는 경우는 찾지 않습니다.
-- 운영 squid.conf와 실제 운영 로그로 `DIFF` 비율을 확인하는 검증은 아직 하지 않았습니다. 테스트는 합성 설정과 로그로 했습니다.
+`main` 브랜치의 [VERIFICATION.md](https://github.com/hyeonsa-claude/squid-simulator/blob/main/docs/VERIFICATION.md#한계)와 같습니다.
+7.7에서 `ident` ACL이 없어졌고, `annotate_client`, `annotate_transaction`, `squid_error`, `connections_encrypted`,
+`snmp_community`가 로그로 판단할 수 없는 타입에 추가되었습니다.

@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/AclSimulator.cci
-@@ -0,0 +1,1567 @@
+@@ -0,0 +1,1589 @@
 +/*
 + * Copyright (C) 1996-2020 The Squid Software Foundation and contributors
 + *
@@ -44,8 +44,10 @@
 +#include "HttpRequest.h"
 +#include "ipcache.h"
 +#include "MasterXaction.h"
++#include "acl/Node.h"
++#include "base/TextException.h"
 +#include "SquidConfig.h"
-+#include "SquidTime.h"
++#include "time/gadgets.h"
 +#include "tools.h"
 +
 +#include <algorithm>
@@ -159,7 +161,7 @@
 +{
 +public:
 +    const Acl::InnerNode *parent;
-+    const ACL *node;
++    const Acl::Node *node;
 +    int result; ///< 1 match, 0 mismatch
 +};
 +
@@ -172,16 +174,31 @@
 +static const std::set<std::string> NoLogData = {
 +    "browser", "referer_regex", "req_header", "req_mime_type", "rep_header", "rep_mime_type",
 +    "http_status", "hier_code", "peername", "peername_regex", "maxconn", "max_user_ip",
-+    "proxy_auth", "proxy_auth_regex", "ident", "ident_regex", "external", "ext_user", "ext_user_regex",
++    "proxy_auth", "proxy_auth_regex", "external", "ext_user", "ext_user_regex",
 +    "user_cert", "ca_cert", "ssl_error", "server_cert_fingerprint", "at_step", "note", "tag",
-+    "clientside_mark", "client_connection_mark", "adaptation_service", "arp", "eui64", "random"
++    "client_connection_mark", "adaptation_service", "arp", "eui64", "random",
++    "annotate_client", "annotate_transaction", "squid_error", "connections_encrypted", "snmp_community"
 +};
 +
++/// the parsed http_access rules (nil without any)
++static const Acl::Tree *
++HttpAccessTree()
++{
++    return (Config.accessList.http && *Config.accessList.http) ? Config.accessList.http->getRaw() : nullptr;
++}
++
++/// the named ACL defined in squid.conf (or nil)
++static Acl::Node *
++NamedAcl(const std::string &name)
++{
++    return Acl::Node::FindByName(SBuf(name.c_str()));
++}
++
 +static void
-+Trace(const ACLChecklist *, const Acl::InnerNode *parent, const ACL *child, int result)
++Trace(const ACLChecklist *, const Acl::InnerNode *parent, const Acl::Node *child, int result)
 +{
 +    if (result < 0 || NoLogData.count(child->typeString())) {
-+        Skipped.insert(child->name);
++        Skipped.insert(child->name.toStdString());
 +        if (result < 0)
 +            return;
 +    }
@@ -302,7 +319,7 @@
 +}
 +
 +static const char *
-+VerdictName(const allow_t &answer)
++VerdictName(const Acl::Answer &answer)
 +{
 +    if (answer.allowed())
 +        return "ALLOW";
@@ -416,10 +433,10 @@
 +}
 +
 +static bool
-+WasSkipped(const ACL *node)
++WasSkipped(const Acl::Node *node)
 +{
-+    const char *name = node->name;
-+    return Skipped.count(name) || (name[0] == '!' && Skipped.count(name + 1));
++    const std::string name = node->name.toStdString();
++    return Skipped.count(name) || (!name.empty() && name[0] == '!' && Skipped.count(name.substr(1)));
 +}
 +
 +/// rule-by-rule evaluation of the last check
@@ -433,7 +450,7 @@
 +            leaves.push_back(&step);
 +            continue;
 +        }
-+        out << "             " << Pad(Short(step.node->name), 5) <<
++        out << "             " << Pad(Short(step.node->name.toStdString()), 5) <<
 +            (step.result ? " MATCH " : " no    ");
 +        for (const auto *leaf : leaves) {
 +            if (leaf->parent != step.node)
@@ -452,7 +469,7 @@
 +CollectRules(const Acl::Tree *tree)
 +{
 +    std::vector<RuleInfo> result;
-+    const SBufList dump = tree->treeDump("http_access", [](const allow_t &a) {
++    const SBufList dump = tree->treeDump("http_access", [](const Acl::Answer &a) {
 +        return a.allowed() ? "allow" : "deny";
 +    });
 +    static const SBuf NewLine("\n");
@@ -519,17 +536,26 @@
 +        return d;
 +    }
 +
-+    Acl::Tree *tree = Config.accessList.http;
++    const Acl::Tree *tree = HttpAccessTree();
++
++    // the http_port listening on localPort, else the first one
++    AnyP::PortCfgPointer listener = HttpPortList;
++    for (AnyP::PortCfgPointer p = HttpPortList; p != nullptr; p = p->next) {
++        if (p->s.port() == localPort) {
++            listener = p;
++            break;
++        }
++    }
 +
 +    HttpRequestMethod method;
 +    method.HttpRequestMethodXXX(r.method.c_str());
-+    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initClient);
++    const auto mx = MasterXaction::MakePortful(listener);
 +    HttpRequest::Pointer request(HttpRequest::FromUrl(SBuf(r.url.c_str()), mx, method));
 +    if (!request) {
 +        d.ruleText = "unparsable URL";
 +        return d;
 +    }
-+    r.host = std::string(request->url.host()) + ":" + std::to_string(request->url.port());
++    r.host = std::string(request->url.host()) + ":" + std::to_string(request->url.port().value_or(0));
 +
 +    unsigned vMajor = 1, vMinor = 1;
 +    if (sscanf(r.version.c_str(), "%u.%u", &vMajor, &vMinor) == 2)
@@ -543,15 +569,7 @@
 +    if (!(request->my_addr = r.localIp.c_str()))
 +        request->my_addr.setAnyAddr();
 +    request->my_addr.port(localPort);
-+    // myportname: the http_port listening on localPort, else the first one
-+    const AnyP::PortCfg *listener = HttpPortList.getRaw();
-+    for (const AnyP::PortCfg *p = listener; p; p = p->next.getRaw()) {
-+        if (p->s.port() == localPort) {
-+            listener = p;
-+            break;
-+        }
-+    }
-+    if (listener && listener->name)
++    if (listener != nullptr && listener->name)
 +        request->myportname = listener->name;
 +    if (DnsMode == 2)
 +        request->flags.destinationIpLookedUp = true; // lookups here are final
@@ -570,15 +588,15 @@
 +    // Pass 0 is the real check. Each later pass ignores all rules up to the
 +    // previous winner, revealing the next matching rule, until none is left.
 +    Skipped.clear();
-+    allow_t firstAnswer;
-+    const ACL *lastEvaluated = nullptr;
++    Acl::Answer firstAnswer;
++    const Acl::Node *lastEvaluated = nullptr;
 +    bool firstPassMatched = false;
 +    std::string trace;
 +    std::set<std::string> unsure; // only pass 0 decides the verdict
 +    ACLChecklist::SkipRulesThrough = -1;
 +    for (size_t pass = 0; pass <= run.rules.size(); ++pass) {
 +        Steps.clear();
-+        ACLFilledChecklist checklist(tree, request.getRaw(), nullptr);
++        ACLFilledChecklist checklist(Config.accessList.http, request.getRaw());
 +        checklist.al = al;
 +        if (DnsMode == 2) {
 +            checklist.markDestinationDomainChecked();
@@ -592,9 +610,9 @@
 +            current_time.tv_usec = 0;
 +            current_dtime = r.when;
 +        }
-+        const allow_t answer = checklist.fastCheck();
++        const Acl::Answer answer = checklist.fastCheck();
 +
-+        const ACL *winner = nullptr;
++        const Acl::Node *winner = nullptr;
 +        for (const auto &step : Steps) {
 +            if (step.parent != tree)
 +                continue;
@@ -610,19 +628,19 @@
 +            unsure = Skipped;
 +            if (!answer.allowed() && !answer.denied()) {
 +                // AUTH or DUNNO: the last ACL checked in that rule ended the check
-+                const ACL *culprit = lastEvaluated;
++                const Acl::Node *culprit = lastEvaluated;
 +                for (const auto &step : Steps) {
 +                    if (lastEvaluated && step.parent == lastEvaluated)
 +                        culprit = step.node;
 +                }
-+                unsure.insert(culprit ? culprit->name : "?");
++                unsure.insert(culprit ? culprit->name.toStdString() : std::string("?"));
 +            }
 +        }
 +        if (!winner)
 +            break;
 +
 +        RuleMatch m;
-+        m.name = winner->name;
++        m.name = winner->name.toStdString();
 +        m.action = answer.allowed() ? "allow" : (answer.denied() ? "deny" : "?");
 +        m.text = winner->cfgline ? winner->cfgline : "";
 +        d.matches.push_back(m);
@@ -641,7 +659,7 @@
 +        d.ruleText = d.matches[0].text;
 +    } else if (!firstAnswer.allowed() && !firstAnswer.denied() && lastEvaluated) {
 +        // an exceptional answer while this rule was being checked
-+        d.rule = lastEvaluated->name;
++        d.rule = lastEvaluated->name.toStdString();
 +        d.ruleText = lastEvaluated->cfgline ? lastEvaluated->cfgline : "";
 +    } else {
 +        d.rule = "implicit";
@@ -685,18 +703,6 @@
 +    run.findings.push_back(f);
 +}
 +
-+static std::string
-+JoinDump(const ACL *acl)
-+{
-+    std::string values;
-+    for (const auto &item : acl->dump()) {
-+        if (!values.empty())
-+            values += " ";
-+        values += item.toStdString();
-+    }
-+    return values;
-+}
-+
 +/// names of ACLs that match every request
 +static std::set<std::string>
 +UniversalAcls()
@@ -710,12 +716,13 @@
 +    }
 +    // "dst all" still needs a DNS answer, so only "src" is universal
 +    static const std::set<std::string> anyAddress = { "all", "0.0.0.0/0", "::/0", "[::]/0" };
-+    for (const ACL *a = Config.aclList; a; a = a->next) {
-+        if (strcmp(a->typeString(), "src") != 0)
++    for (const auto &name : Acl::AclDefinitionOrder) {
++        const auto a = NamedAcl(name);
++        if (!a || strcmp(a->typeString(), "src") != 0)
 +            continue;
 +        for (const auto &item : a->dump()) {
 +            if (anyAddress.count(item.toStdString()))
-+                names.insert(a->name);
++                names.insert(name);
 +        }
 +    }
 +    return names;
@@ -739,20 +746,30 @@
 +        else if (note.kind == "universal")
 +            AddFinding(run, 2, "matches everything", note.acl, note.where + "  " + note.line, note.message,
 +                       "use the built-in 'all' ACL or remove the pattern");
++        else if (note.kind == "overlap")
++            AddFinding(run, 1, "overlapping entries", note.acl, note.where + "  " + note.line, note.message,
++                       "replace the overlapping entries with the merged one");
 +    }
 +
-+    // unused and identical ACL definitions
++    // unused and identical ACL definitions (in squid.conf order)
 +    std::map<std::string, std::vector<std::string> > bySignature;
-+    for (ACL *a = Config.aclList; a; a = a->next) {
-+        if (Acl::PredefinedAcls.count(a->name))
++    for (const auto &name : Acl::AclDefinitionOrder) {
++        const auto a = NamedAcl(name);
++        if (!a || Acl::PredefinedAcls.count(Lower(name)))
 +            continue;
-+        if (!Acl::AclReferences.count(Lower(a->name)))
-+            AddFinding(run, 1, "unused ACL", a->name, a->cfgline ? a->cfgline : "",
++        if (!Acl::AclReferences.count(Lower(name)))
++            AddFinding(run, 1, "unused ACL", name, a->cfgline ? a->cfgline : "",
 +                       "defined, but no directive or other ACL uses it", "delete its acl line(s)");
-+        std::string options;
-+        for (const auto &option : a->dumpOptions())
-+            options += option.toStdString() + " ";
-+        bySignature[std::string(a->typeString()) + " " + options + JoinDump(a)].push_back(a->name);
++        // "acl NAME TYPE OPTIONS VALUES" without "acl NAME"
++        std::ostringstream whole;
++        a->dumpWhole("acl", whole);
++        std::string signature = whole.str();
++        const auto nameEnd = signature.find(' ', signature.find(' ') + 1);
++        if (nameEnd != std::string::npos)
++            signature.erase(0, nameEnd + 1);
++        while (!signature.empty() && (signature.back() == '\n' || signature.back() == ' '))
++            signature.pop_back();
++        bySignature[signature].push_back(name);
 +    }
 +    for (const auto &entry : bySignature) {
 +        if (entry.second.size() < 2)
@@ -1481,7 +1498,7 @@
 +static bool
 +RunConfig(ConfigRun &run, const bool current, const bool printEach)
 +{
-+    Acl::Tree *tree = Config.accessList.http;
++    const Acl::Tree *tree = HttpAccessTree();
 +    if (!tree) {
 +        std::cerr << "squid --simulate: " << run.path << " has no http_access rules" << std::endl;
 +        return false;
@@ -1521,7 +1538,7 @@
 +    // per-request lines only when they are the main output
 +    const bool printEach = LogFile && !CompareConf && (!ReportFile || ShowTrace);
 +
-+    Runs[0].path = ConfigFile;
++    Runs[0].path = ConfigFile ? ConfigFile : "";
 +    if (!RunConfig(Runs[0], true, printEach))
 +        return 1;
 +    if (Optimize)
@@ -1530,8 +1547,13 @@
 +    if (CompareConf) {
 +        Runs[1].path = CompareConf;
 +        Acl::ClearConfigNotes();
-+        if (parseConfigFile(CompareConf) != 0) {
-+            std::cerr << "squid --simulate: errors in " << CompareConf << std::endl;
++        // Configuration::Parse() reads the global ConfigFile, as reconfiguration does
++        xfree(ConfigFile);
++        ConfigFile = xstrdup(CompareConf);
++        try {
++            Configuration::Parse();
++        } catch (...) {
++            std::cerr << "squid --simulate: errors in " << CompareConf << ": " << CurrentException << std::endl;
 +            return 1;
 +        }
 +        if (!RunConfig(Runs[1], false, false))
@@ -1570,7 +1592,7 @@
 +
 --- a/src/cache_cf.cc
 +++ b/src/cache_cf.cc
-@@ -3918,8 +3918,9 @@
+@@ -3938,8 +3938,9 @@
      if (stat(path, &sb) < 0) {
          int xerrno = errno;
          debugs(0, DBG_CRITICAL, (opt_parse_cfg_only?"FATAL: ":"ERROR: ") << name << " " << path << ": " << xstrerr(xerrno));
@@ -1584,7 +1606,7 @@
          if (opt_send_signal == -1 || opt_send_signal == SIGHUP)
 --- a/src/external_acl.cc
 +++ b/src/external_acl.cc
-@@ -646,6 +646,10 @@
+@@ -649,6 +649,10 @@
              return ACCESS_DUNNO;
          }
  
@@ -1597,44 +1619,39 @@
          const ExternalACLEntryPointer staleEntry = entry;
 --- a/src/fqdncache.cc
 +++ b/src/fqdncache.cc
-@@ -20,12 +20,16 @@
- #include "SquidConfig.h"
- #include "SquidTime.h"
- #include "StatCounters.h"
-+#include "sbuf/List.h"
- #include "Store.h"
- #include "util.h"
- 
- #if SQUID_SNMP
+@@ -27,6 +27,11 @@
  #include "snmp_core.h"
  #endif
+ 
++#include "sbuf/List.h"
 +
 +#include <set>
 +#include <string>
++
+ bool Dns::ResolveClientAddressesAsap = false;
  
  /**
-  \defgroup FQDNCacheAPI FQDN Cache API
-@@ -129,6 +133,9 @@
+@@ -128,6 +133,9 @@
+ static void fqdncacheLockEntry(fqdncache_entry * f);
  static void fqdncacheUnlockEntry(fqdncache_entry * f);
- static FREE fqdncacheFreeEntry;
  static void fqdncacheAddEntry(fqdncache_entry * f);
 +static const char *fqdncacheSimulatorLookup(const Ip::Address &addr, char *name);
 +
 +int fqdncache_simulator_mode = 0;
  
  /// \ingroup FQDNCacheInternal
- static hash_table *fqdn_table = NULL;
-@@ -511,6 +518,9 @@
- 
+ static hash_table *fqdn_table = nullptr;
+@@ -514,6 +522,9 @@
+     debugs(35, 5, "MISS: " << addr);
      ++ FqdncacheStats.misses;
  
 +    if (fqdncache_simulator_mode)
-+        return (flags & FQDN_LOOKUP_IF_MISS) ? fqdncacheSimulatorLookup(addr, name) : NULL;
++        return (flags & FQDN_LOOKUP_IF_MISS) ? fqdncacheSimulatorLookup(addr, name) : nullptr;
 +
      if (flags & FQDN_LOOKUP_IF_MISS) {
-         fqdncache_nbgethostbyaddr(addr, NULL, NULL);
+         fqdncache_nbgethostbyaddr(addr, nullptr, nullptr);
      }
-@@ -680,6 +690,36 @@
+@@ -666,6 +677,36 @@
      fqdncacheLockEntry(fce);
  }
  
@@ -1644,28 +1661,28 @@
 +fqdncacheSimulatorLookup(const Ip::Address &addr, char *name)
 +{
 +    if (fqdncache_simulator_mode != 2)
-+        return NULL;
++        return nullptr;
 +
 +    static std::set<std::string> failed; // do not repeat blocking lookups that failed
 +    if (failed.count(name))
-+        return NULL;
++        return nullptr;
 +
-+    struct addrinfo *ai = NULL;
++    struct addrinfo *ai = nullptr;
 +    addr.getAddrInfo(ai);
 +    char host[1025]; // NI_MAXHOST
-+    const int err = getnameinfo(ai->ai_addr, ai->ai_addrlen, host, sizeof(host), NULL, 0, NI_NAMEREQD);
++    const int err = getnameinfo(ai->ai_addr, ai->ai_addrlen, host, sizeof(host), nullptr, 0, NI_NAMEREQD);
 +    Ip::Address::FreeAddr(ai);
 +    if (err != 0) {
 +        debugs(35, 3, "simulator: no rDNS for " << name);
 +        failed.insert(name);
-+        return NULL;
++        return nullptr;
 +    }
 +
 +    SBufList names;
 +    names.push_back(SBuf(host));
 +    fqdncacheAddEntryFromHosts(name, names);
 +    const fqdncache_entry *f = fqdncache_get(name);
-+    return f ? f->names[0] : NULL;
++    return f ? f->names[0] : nullptr;
 +}
 +
  /// \ingroup FQDNCacheInternal
@@ -1673,18 +1690,18 @@
  fqdncacheRegisterWithCacheManager(void)
 --- a/src/fqdncache.h
 +++ b/src/fqdncache.h
-@@ -32,5 +32,8 @@
+@@ -34,5 +34,8 @@
  const char *fqdncache_gethostbyaddr(const Ip::Address &, int flags);
  void fqdncache_nbgethostbyaddr(const Ip::Address &, FQDNH *, void *);
  
 +/// offline ACL simulator rDNS behaviour; see ipcache_simulator_mode
 +extern int fqdncache_simulator_mode;
 +
- #endif /* SQUID_FQDNCACHE_H_ */
+ #endif /* SQUID_SRC_FQDNCACHE_H */
  
 --- a/src/globals.h
 +++ b/src/globals.h
-@@ -110,6 +110,7 @@
+@@ -103,6 +103,7 @@
  extern int opt_send_signal; /* -1 */
  extern int opt_no_daemon; /* 0 */
  extern int opt_parse_cfg_only; /* 0 */
@@ -1694,39 +1711,37 @@
  /// Zero for SMP-unaware code and in no-SMP mode.
 --- a/src/ipcache.cc
 +++ b/src/ipcache.cc
-@@ -26,6 +26,11 @@
- #include "util.h"
- #include "wordlist.h"
- 
-+#include <algorithm>
-+#include <set>
-+#include <string>
-+#include <vector>
-+
- #if SQUID_SNMP
+@@ -32,6 +32,9 @@
  #include "snmp_core.h"
  #endif
-@@ -132,6 +137,9 @@
- static ipcache_entry *ipcache_get(const char *);
- static void ipcacheLockEntry(ipcache_entry *);
- static void ipcacheStatPrint(ipcache_entry *, StoreEntry *);
+ 
++#include <set>
++#include <string>
++
+ /**
+  \defgroup IPCacheAPI IP Cache API
+  \ingroup Components
+@@ -201,6 +204,9 @@
+ static void ipcacheUnlockEntry(ipcache_entry *);
+ static void ipcacheRelease(ipcache_entry *, bool dofree = true);
+ static const Dns::CachedIps *ipcacheCheckNumeric(const char *name);
 +static const ipcache_addrs *ipcacheSimulatorLookup(const char *name);
 +
 +int ipcache_simulator_mode = 0;
- static void ipcacheUnlockEntry(ipcache_entry *);
- static void ipcacheRelease(ipcache_entry *, bool dofree = true);
+ static void ipcache_nbgethostbyname_(const char *name, IpCacheLookupForwarder handler);
  
-@@ -639,6 +647,9 @@
+ /// \ingroup IPCacheInternal
+@@ -758,6 +764,9 @@
      }
  
      ++IpcacheStats.misses;
 +
 +    if (ipcache_simulator_mode)
-+        return (flags & IP_LOOKUP_IF_MISS) ? ipcacheSimulatorLookup(name) : NULL;
++        return (flags & IP_LOOKUP_IF_MISS) ? ipcacheSimulatorLookup(name) : nullptr;
  
      if (flags & IP_LOOKUP_IF_MISS)
-         ipcache_nbgethostbyname(name, NULL, NULL);
-@@ -1072,6 +1083,58 @@
+         ipcache_nbgethostbyname(name, nullptr, nullptr);
+@@ -1163,6 +1172,50 @@
      return 0;
  }
  
@@ -1736,46 +1751,38 @@
 +ipcacheSimulatorLookup(const char *name)
 +{
 +    if (ipcache_simulator_mode != 2)
-+        return NULL;
++        return nullptr;
 +
 +    static std::set<std::string> failed; // do not repeat blocking lookups that failed
 +    if (failed.count(name))
-+        return NULL;
++        return nullptr;
 +
 +    struct addrinfo hints;
 +    memset(&hints, 0, sizeof(hints));
 +    hints.ai_family = Ip::EnableIpv6 ? AF_UNSPEC : AF_INET;
 +    hints.ai_socktype = SOCK_STREAM;
-+    struct addrinfo *res = NULL;
-+    if (getaddrinfo(name, NULL, &hints, &res) != 0 || !res) {
++    struct addrinfo *res = nullptr;
++    if (getaddrinfo(name, nullptr, &hints, &res) != 0 || !res) {
 +        debugs(14, 3, "simulator: cannot resolve " << name);
 +        failed.insert(name);
-+        return NULL;
++        return nullptr;
 +    }
 +
-+    std::vector<Ip::Address> found;
-+    for (const struct addrinfo *ai = res; ai && found.size() < 32; ai = ai->ai_next) {
++    const auto i = new ipcache_entry(name);
++    for (const struct addrinfo *ai = res; ai; ai = ai->ai_next) {
 +        Ip::Address a;
 +        if (!(a = *ai))
 +            continue;
 +        a.port(0);
-+        if (std::find(found.begin(), found.end(), a) == found.end())
-+            found.push_back(a);
++        i->addrs.pushUnique(a);
 +    }
 +    freeaddrinfo(res);
-+    if (found.empty()) {
++    if (i->addrs.empty()) {
++        delete i;
 +        failed.insert(name);
-+        return NULL;
++        return nullptr;
 +    }
 +
-+    ipcache_entry *i = new ipcache_entry(name);
-+    i->addrs.count = found.size();
-+    i->addrs.cur = 0;
-+    i->addrs.badcount = 0;
-+    i->addrs.in_addrs = static_cast<Ip::Address *>(xcalloc(found.size(), sizeof(Ip::Address)));
-+    i->addrs.bad_mask = (unsigned char *)xcalloc(found.size(), sizeof(unsigned char));
-+    for (size_t k = 0; k < found.size(); ++k)
-+        i->addrs.in_addrs[k] = found[k];
 +    i->flags.fromhosts = true;
 +    ipcacheAddEntry(i);
 +    ipcacheLockEntry(i);
@@ -1787,7 +1794,7 @@
   \ingroup IPCacheAPI
 --- a/src/ipcache.h
 +++ b/src/ipcache.h
-@@ -41,5 +41,10 @@
+@@ -237,6 +237,11 @@
  void ipcache_restart(void);
  int ipcacheAddEntryFromHosts(const char *name, const char *ipaddr);
  
@@ -1796,24 +1803,25 @@
 +/// 2 = blocking system resolver (getaddrinfo) on cache misses
 +extern int ipcache_simulator_mode;
 +
- #endif /* _SQUID_IPCACHE_H */
+ /* inlined implementations */
  
+ inline Dns::IpsSelector<Dns::GoodIpsIterator>
 --- a/src/main.cc
 +++ b/src/main.cc
-@@ -135,6 +135,9 @@
- #include <sys/wait.h>
+@@ -178,6 +178,9 @@
+ #include "test_access.c"
  #endif
  
 +// offline http_access simulator (squid --simulate, --optimize)
 +#include "AclSimulator.cci"
 +
- #if USE_WIN32_SERVICE
- #include <process.h>
+ /** temporary thunk across to the unrefactored store interface */
  
-@@ -404,7 +407,24 @@
-             "       -R        Do not set REUSEADDR on port.\n"
+ class StoreRootEngine : public AsyncEngine
+@@ -370,7 +373,24 @@
              "       -S        Double-check swap during rebuild.\n"
              "       -X        Force full debugging.\n"
+             "                 Add -d9 to also write full debugging to stderr.\n"
 -            "       -Y        Only return UDP_HIT or UDP_MISS_NOFETCH during fast reload.\n",
 +            "       -Y        Only return UDP_HIT or UDP_MISS_NOFETCH during fast reload.\n"
 +            "       --simulate access.log|-\n"
@@ -1836,7 +1844,7 @@
              APP_SHORTNAME, CACHE_HTTP_PORT, DEFAULT_CONFIG_FILE, CACHE_ICP_PORT);
      exit(EXIT_FAILURE);
  }
-@@ -415,7 +435,14 @@
+@@ -381,7 +401,14 @@
      // not be used: Values below 2 are for special getopt_long(3) use cases, and
      // values in the [33,126] range are reserved for short options (-x).
      optForeground = 2,
@@ -1852,21 +1860,21 @@
  };
  
  // short options
-@@ -431,6 +458,13 @@
+@@ -397,6 +424,13 @@
  static struct option squidOptions[] = {
-     {"foreground", no_argument, 0,  optForeground},
-     {"kid",        required_argument, 0, optKid},
-+    {"simulate",   required_argument, 0, optSimulate},
-+    {"sim-trace",  no_argument, 0, optSimTrace},
-+    {"sim-dns",    required_argument, 0, optSimDns},
-+    {"sim-port",   required_argument, 0, optSimPort},
-+    {"sim-compare", required_argument, 0, optSimCompare},
-+    {"report",     required_argument, 0, optReport},
-+    {"optimize",   no_argument, 0, optOptimize},
-     {"help",       no_argument, 0, 'h'},
-     {"version",    no_argument, 0, 'v'},
-     {0, 0, 0, 0}
-@@ -708,6 +742,45 @@
+     {"foreground", no_argument, nullptr,  optForeground},
+     {"kid",        required_argument, nullptr, optKid},
++    {"simulate",   required_argument, nullptr, optSimulate},
++    {"sim-trace",  no_argument, nullptr, optSimTrace},
++    {"sim-dns",    required_argument, nullptr, optSimDns},
++    {"sim-port",   required_argument, nullptr, optSimPort},
++    {"sim-compare", required_argument, nullptr, optSimCompare},
++    {"report",     required_argument, nullptr, optReport},
++    {"optimize",   no_argument, nullptr, optOptimize},
+     {"help",       no_argument, nullptr, 'h'},
+     {"version",    no_argument, nullptr, 'v'},
+     {nullptr, 0, nullptr, 0}
+@@ -678,6 +712,45 @@
  
      case optKid:
          // already processed in ConfigureCurrentKid()
@@ -1912,16 +1920,16 @@
          break;
  
      case 'h':
-@@ -1582,6 +1655,14 @@
-         if (opt_parse_cfg_only || parse_err > 0)
-             return parse_err;
+@@ -1603,6 +1676,14 @@
+         if (opt_parse_cfg_only)
+             return EXIT_SUCCESS;
      }
 +
 +    if (AclSimulator::LogFile || AclSimulator::Optimize)
 +        return AclSimulator::Run();
 +    if (AclSimulator::CompareConf || AclSimulator::ReportFile) {
 +        std::cerr << "--sim-compare and --report need --simulate or --optimize" << std::endl;
-+        return 1;
++        return EXIT_FAILURE;
 +    }
 +
      setUmask(Config.umask);
@@ -1929,24 +1937,24 @@
      // Master optimization: Where possible, avoid pointless daemon fork() and/or
 --- a/src/acl/Acl.cc
 +++ b/src/acl/Acl.cc
-@@ -25,9 +25,75 @@
+@@ -27,10 +27,88 @@
  #include "SquidConfig.h"
  
  #include <algorithm>
 +#include <cctype>
  #include <map>
+ #include <unordered_map>
  
- const char *AclMatchedName = NULL;
-+
 +bool Acl::CollectConfigNotes = false;
 +std::vector<Acl::ConfigNote> Acl::ConfigNotes;
 +std::map<std::string, unsigned> Acl::AclReferences;
 +std::set<std::string> Acl::PredefinedAcls;
++std::vector<std::string> Acl::AclDefinitionOrder;
 +
-+/// the ACL whose values are being parsed now (or nil)
-+static const char *ParsingAcl = nullptr;
++/// the ACL whose values are being parsed now (empty if none)
++static std::string ParsingAcl;
 +/// the type of ParsingAcl
-+static const char *ParsingAclType = nullptr;
++static std::string ParsingAclType;
 +/// values of each ACL seen so far, for duplicate detection
 +static std::map<std::string, std::set<std::string> > SeenValues;
 +
@@ -1957,21 +1965,27 @@
 +    return cfg_filename && strncmp(cfg_filename, "Default Configuration", 21) == 0;
 +}
 +
++/// ACL names are case-insensitive
++static std::string
++AclKey(const SBuf &name)
++{
++    std::string key = name.toStdString();
++    for (auto &c : key)
++        c = tolower(static_cast<unsigned char>(c));
++    return key;
++}
++
 +void
 +Acl::NoteConfig(const char *kind, const std::string &message, const char *aclName, const char *aclType)
 +{
 +    if (!CollectConfigNotes || ParsingDefaults())
 +        return;
-+    if (!aclName) {
-+        aclName = ParsingAcl;
-+        aclType = ParsingAclType;
-+    }
-+    if (!aclName)
++    if (!aclName && ParsingAcl.empty())
 +        return; // not parsing (e.g., matching uses the same comparison code)
 +    ConfigNote note;
 +    note.kind = kind;
-+    note.acl = aclName;
-+    note.type = aclType ? aclType : "";
++    note.acl = aclName ? aclName : ParsingAcl;
++    note.type = aclName ? (aclType ? aclType : "") : ParsingAclType;
 +    note.where = std::string(cfg_filename ? cfg_filename : "?") + ":" + std::to_string(config_lineno);
 +    note.line = config_input_line;
 +    note.message = message;
@@ -1981,18 +1995,14 @@
 +bool
 +Acl::SeenValue(const std::string &value)
 +{
-+    return CollectConfigNotes && ParsingAcl && !SeenValues[ParsingAcl].insert(value).second;
++    return CollectConfigNotes && !ParsingAcl.empty() && !SeenValues[ParsingAcl].insert(value).second;
 +}
 +
 +void
 +Acl::NoteReference(const char *aclName)
 +{
-+    if (!CollectConfigNotes)
-+        return;
-+    std::string key(aclName);
-+    for (auto &c : key)
-+        c = tolower(static_cast<unsigned char>(c)); // ACL names are case-insensitive
-+    ++AclReferences[key];
++    if (CollectConfigNotes)
++        ++AclReferences[AclKey(SBuf(aclName))];
 +}
 +
 +void
@@ -2000,68 +2010,89 @@
 +{
 +    ConfigNotes.clear();
 +    AclReferences.clear();
++    AclDefinitionOrder.clear();
 +    SeenValues.clear();
 +}
- 
++
  namespace Acl {
++
++/// remembers which ACL is being parsed while its values are parsed (parsers may throw)
++class ParsingAclScope
++{
++public:
++    explicit ParsingAclScope(const Node &acl) { ParsingAcl = acl.name.toStdString(); ParsingAclType = acl.typeString(); }
++    ~ParsingAclScope() { ParsingAcl.clear(); ParsingAclType.clear(); }
++};
  
-@@ -223,6 +289,7 @@
-     } else if (strcmp(theType, "proto") == 0 && strcmp(aclname, "manager") == 0) {
+ /// parsed "acl aclname ..." directives indexed by aclname
+ class NamedAcls: public std::unordered_map<SBuf, Acl::Node::Pointer,
+@@ -286,6 +364,7 @@
+     } else if (strcmp(theType, "proto") == 0 && aclname.cmp("manager") == 0) {
          // ACL manager is now a built-in and has a different type.
-         debugs(28, DBG_PARSE_NOTE(DBG_IMPORTANT), "UPGRADE: ACL 'manager' is now a built-in ACL. Remove it from your config file.");
-+        Acl::NoteConfig("predefined", "'manager' is a built-in ACL; Squid ignores this line", aclname, theType);
+         debugs(28, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: UPGRADE: ACL 'manager' is now a built-in ACL. Remove it from your config file.");
++        Acl::NoteConfig("predefined", "'manager' is a built-in ACL; Squid ignores this line", "manager", theType);
          return; // ignore the line
-     }
- 
-@@ -231,7 +298,12 @@
+     } else if (strcmp(theType, "clientside_mark") == 0) {
+         debugs(28, DBG_IMPORTANT, "WARNING: UPGRADE: ACL 'clientside_mark' type has been renamed to 'client_connection_mark'.");
+@@ -299,7 +378,15 @@
          A = Acl::Make(theType);
          A->context(aclname, config_input_line);
          new_acl = 1;
 +        if (ParsingDefaults())
-+            Acl::PredefinedAcls.insert(aclname);
++            Acl::PredefinedAcls.insert(AclKey(aclname));
++        else if (Acl::CollectConfigNotes)
++            Acl::AclDefinitionOrder.push_back(aclname.toStdString());
      } else {
-+        if (Acl::PredefinedAcls.count(aclname))
-+            Acl::NoteConfig("predefined", std::string("'") + aclname + "' is a built-in ACL (" +
-+                            (A->cfgline ? A->cfgline : "") + "); this line only adds to it", aclname, theType);
++        if (Acl::PredefinedAcls.count(AclKey(aclname)) && !ParsingDefaults())
++            Acl::NoteConfig("predefined", "'" + aclname.toStdString() + "' is a built-in ACL (" +
++                            (A->cfgline ? A->cfgline : "") + "); this line only adds to it",
++                            aclname.toStdString().c_str(), theType);
          if (strcmp (A->typeString(),theType) ) {
              debugs(28, DBG_CRITICAL, "aclParseAclLine: ACL '" << A->name << "' already exists with different type.");
              parser.destruct();
-@@ -251,7 +323,11 @@
-     A->parseFlags();
+@@ -310,10 +397,13 @@
+         new_acl = 0;
+     }
  
-     /*split the function here */
-+    ParsingAcl = A->name;
-+    ParsingAclType = A->typeString();
-     A->parse();
-+    ParsingAcl = nullptr;
-+    ParsingAclType = nullptr;
+-    A->parseFlags();
+-
+-    /*split the function here */
+-    A->parse();
++    {
++        const Acl::ParsingAclScope scope(*A);
++        A->parseFlags();
++
++        /*split the function here */
++        A->parse();
++    }
  
-     /*
-      * Clear AclMatchedName from our temporary hack
+     if (!new_acl)
+         return;
 --- a/src/acl/Acl.h
 +++ b/src/acl/Acl.h
-@@ -17,7 +17,11 @@
- #include "sbuf/forward.h"
+@@ -15,8 +15,12 @@
+ #include "sbuf/SBuf.h"
  
  #include <algorithm>
 +#include <map>
+ #include <optional>
  #include <ostream>
 +#include <set>
 +#include <string>
 +#include <vector>
  
- class ConfigParser;
+ namespace Acl {
  
-@@ -29,6 +33,36 @@
- typedef ACL *(*Maker)(TypeName typeName);
- /// use the given ACL Maker for all ACLs of the named type
+@@ -26,6 +30,38 @@
+ using Maker = Node *(*)(TypeName typeName);
+ /// use the given Acl::Node Maker for all ACLs of the named type
  void RegisterMaker(TypeName typeName, Maker maker);
 +
 +/// a questionable "acl" line detail noticed while parsing (squid --optimize)
 +class ConfigNote
 +{
 +public:
-+    std::string kind; ///< predefined, covered, duplicate, or universal
++    std::string kind; ///< predefined, covered, duplicate, overlap, or universal
 +    std::string acl; ///< ACL name
 +    std::string type; ///< ACL type (e.g., dstdomain)
 +    std::string where; ///< file:line
@@ -2075,8 +2106,10 @@
 +extern std::vector<ConfigNote> ConfigNotes;
 +/// how many times each (lowercased) ACL name is used by directives and other ACLs
 +extern std::map<std::string, unsigned> AclReferences;
-+/// names of ACLs created by Squid's own default configuration
++/// names of ACLs created by Squid's own default configuration (lowercased)
 +extern std::set<std::string> PredefinedAcls;
++/// names of all named ACLs in squid.conf order (named ACLs are stored unordered)
++extern std::vector<std::string> AclDefinitionOrder;
 +
 +/// records a note about the given (or the currently parsed) ACL
 +void NoteConfig(const char *kind, const std::string &message, const char *aclName = nullptr, const char *aclType = nullptr);
@@ -2087,49 +2120,49 @@
 +/// forgets notes, references, and seen values (before parsing another squid.conf)
 +void ClearConfigNotes();
  
- } // namespace Acl
- 
+ /// Validate and store the ACL key parameter for ACL types
+ /// declared using "acl aclname type key argument..." declaration that
 --- a/src/acl/Checklist.cc
 +++ b/src/acl/Checklist.cc
-@@ -53,6 +53,9 @@
-     cbdataReferenceDone(accessList);
-     checkCallback(currentAnswer());
+@@ -40,6 +40,9 @@
+ 
+     checkCallback(nullptr);
  }
 +
 +ACLChecklist::TraceHook *ACLChecklist::Tracer = nullptr;
 +int ACLChecklist::SkipRulesThrough = -1;
  
  void
- ACLChecklist::markFinished(const allow_t &finalAnswer, const char *reason)
-@@ -105,6 +108,8 @@
+ ACLChecklist::markFinished(const Acl::Answer &finalAnswer, const char *reason)
+@@ -94,6 +97,8 @@
          matchPath.push(Breadcrumb(current, pos));
      } else {
          asyncLoc_.clear();
 +        if (Tracer)
-+            Tracer(this, current, child, result ? 1 : 0);
++            Tracer(this, current, child.getRaw(), result ? 1 : 0);
      }
  
      matchLoc_.clear();
-@@ -121,6 +126,8 @@
+@@ -109,6 +114,8 @@
      // TODO: add a once-in-a-while WARNING about fast directive using slow ACL?
      if (!asyncCaller_) {
          debugs(28, 2, this << " a fast-only directive uses a slow ACL!");
 +        if (Tracer)
-+            Tracer(this, matchLoc_.parent, *matchLoc_.position, -1);
++            Tracer(this, matchLoc_.parent.getRaw(), &acl, -1);
          return false;
      }
  
 --- a/src/acl/Checklist.h
 +++ b/src/acl/Checklist.h
-@@ -141,6 +141,15 @@
-     /// Matches (or resumes matching of) a child node while maintaning
+@@ -91,6 +91,15 @@
+     /// Matches (or resumes matching of) a child node at pos while maintaining
      /// resumption breadcrumbs if a [grand]child node goes async.
-     bool matchChild(const Acl::InnerNode *parent, Acl::Nodes::const_iterator pos, const ACL *child);
+     bool matchChild(const Acl::InnerNode *parent, Acl::Nodes::const_iterator pos);
 +
 +    /// Observer of individual node matching results, used by the offline
 +    /// ACL simulator (squid --simulate). The result is 1 (match), 0 (mismatch),
 +    /// or -1 (a slow ACL needed an async lookup that this check cannot do).
-+    typedef void TraceHook(const ACLChecklist *, const Acl::InnerNode *parent, const ACL *child, int result);
++    typedef void TraceHook(const ACLChecklist *, const Acl::InnerNode *parent, const Acl::Node *child, int result);
 +    static TraceHook *Tracer; ///< nil unless simulating
 +    /// simulator: Acl::Tree ignores its rules at positions [0, SkipRulesThrough]
 +    /// so that the rules matching after the decisive one can be found (-1: off)
@@ -2137,81 +2170,82 @@
  
      /// Whether we should continue to match tree nodes or stop/pause.
      bool keepMatching() const { return !finished() && !asyncInProgress(); }
---- a/src/acl/DomainData.cc
-+++ b/src/acl/DomainData.cc
-@@ -9,6 +9,7 @@
- /* DEBUG: section 28    Access Control */
- 
- #include "squid.h"
-+#include "acl/Acl.h"
- #include "acl/Checklist.h"
- #include "acl/DomainData.h"
- #include "anyp/Uri.h"
-@@ -80,6 +81,7 @@
-             bool d3big = (strlen(d3) > strlen(d4)); // Always suggest removing the longer one.
-             debugs(28, DBG_IMPORTANT, "WARNING: '" << (d3big?d3:d4) << "' is a subdomain of '" << (d3big?d4:d3) << "'");
-             debugs(28, DBG_IMPORTANT, "WARNING: You should remove '" << (d3big?d3:d4) << "' from the ACL named '" << AclMatchedName << "'");
-+            Acl::NoteConfig("covered", std::string("'") + (d3big?d3:d4) + "' is already covered by '" + (d3big?d4:d3) + "'");
-             debugs(28, 2, HERE << "Ignore '" << d3 << "' to keep splay tree searching predictable");
-         }
-     } else if (ret == 0) {
-@@ -87,6 +89,7 @@
-         if (strcmp(d1,d2)==0) {
-             debugs(28, 2, "WARNING: '" << d2 << "' is duplicated in the list.");
-             debugs(28, 2, "WARNING: You should remove one '" << d2 << "' from the ACL named '" << AclMatchedName << "'");
-+            Acl::NoteConfig("duplicate", std::string("'") + d2 + "' is listed more than once");
-             return ret;
-         }
-         // When a.example.com comes before .example.com in an ACL
 --- a/src/acl/InnerNode.cc
 +++ b/src/acl/InnerNode.cc
-@@ -62,6 +62,7 @@
+@@ -64,6 +64,7 @@
              self_destruct();
-             return;
+             return count; // not reached
          }
 +        Acl::NoteReference(t);
  
          // append(negated ? new NotNode(a) : a);
          if (negated)
---- a/src/acl/Ip.cc
-+++ b/src/acl/Ip.cc
-@@ -9,6 +9,7 @@
- /* DEBUG: section 28    Access Control */
- 
- #include "squid.h"
-+#include "acl/Acl.h"
- #include "acl/Checklist.h"
- #include "acl/Ip.h"
- #include "cache_cf.h"
-@@ -142,6 +143,10 @@
-         debugs(28, DBG_CRITICAL, "WARNING: (" << (bina?'B':'A') << ") '" << buf_n1 << "' is a subnetwork of (" << (bina?'A':'B') << ") '" << buf_n2 << "'");
-         debugs(28, DBG_CRITICAL, "WARNING: because of this '" << (bina?buf_n2:buf_n1) << "' is ignored to keep splay tree searching predictable");
-         debugs(28, DBG_CRITICAL, "WARNING: You should probably remove '" << buf_n1 << "' from the ACL named '" << AclMatchedName << "'");
-+        if (strcmp(buf_n1, buf_n2) == 0)
-+            Acl::NoteConfig("duplicate", std::string("'") + buf_n1 + "' is listed more than once");
-+        else
-+            Acl::NoteConfig("covered", std::string("'") + buf_n1 + "' is already covered by '" + buf_n2 + "'");
-     }
- 
-     return ret;
 --- a/src/acl/RegexData.cc
 +++ b/src/acl/RegexData.cc
-@@ -243,6 +243,12 @@
-         } else {
-             debugs(28, 3, "buffering RE '" << clean << "'");
-             sl.emplace_back(clean);
-+            if (!strcmp(clean, "-i") || !strcmp(clean, "+i"))
-+                continue; // flags, not patterns
-+            if (!strcmp(clean, ".*") || !strcmp(clean, ".") || !strcmp(clean, "^"))
-+                Acl::NoteConfig("universal", std::string("regular expression '") + t + "' matches every value");
-+            else if (Acl::SeenValue(clean))
-+                Acl::NoteConfig("duplicate", std::string("regular expression '") + clean + "' is listed more than once");
-         }
+@@ -231,6 +231,12 @@
+         const char *clean = removeUnnecessaryWildcards(t);
+         debugs(28, 3, "buffering RE '" << clean << "'");
+         sl.emplace_back(clean);
++        if (!strcmp(clean, "-i") || !strcmp(clean, "+i"))
++            continue; // flags, not patterns
++        if (!strcmp(clean, ".*") || !strcmp(clean, ".") || !strcmp(clean, "^"))
++            Acl::NoteConfig("universal", std::string("regular expression '") + t + "' matches every value");
++        else if (Acl::SeenValue(clean))
++            Acl::NoteConfig("duplicate", std::string("regular expression '") + clean + "' is listed more than once");
      }
  
+     try {
+--- a/src/acl/SplayInserter.h
++++ b/src/acl/SplayInserter.h
+@@ -13,6 +13,9 @@
+ #include "debug/Stream.h"
+ #include "globals.h"
+ #include "splay.h"
++
++#include <sstream>
++#include <string>
+ 
+ namespace Acl {
+ 
+@@ -68,12 +71,18 @@
+ Acl::SplayInserter<DataValue>::Merge(Splay<Value> &storage, Value &&newItem)
+ {
+     const auto comparator = &SplayInserter<Value>::Compare;
++    // values as squid.conf spells them, for squid --optimize notes
++    const auto text = [](const Value &v) { std::ostringstream os; os << v; return os.str(); };
+     while (const auto oldItemPointer = storage.insert(newItem, comparator)) {
+         const auto oldItem = *oldItemPointer;
+ 
+         if (IsSubset(newItem, oldItem)) {
+             debugs(28, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: Ignoring " << newItem << " because it is already covered by " << oldItem <<
+                    Debug::Extra << "advice: Remove value " << newItem << " from the ACL");
++            if (IsSubset(oldItem, newItem))
++                Acl::NoteConfig("duplicate", "'" + text(newItem) + "' is listed more than once");
++            else
++                Acl::NoteConfig("covered", "'" + text(newItem) + "' is already covered by '" + text(oldItem) + "'");
+             DestroyValue(newItem);
+             return;
+         }
+@@ -81,6 +90,7 @@
+         if (IsSubset(oldItem, newItem)) {
+             debugs(28, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: Ignoring earlier " << oldItem << " because it is covered by " << newItem <<
+                    Debug::Extra << "advice: Remove value " << oldItem << " from the ACL");
++            Acl::NoteConfig("covered", "'" + text(oldItem) + "' is already covered by '" + text(newItem) + "'");
+             storage.remove(oldItem, comparator);
+             DestroyValue(oldItem);
+             continue; // still need to insert newItem (and it may conflict with other old items)
+@@ -89,6 +99,8 @@
+         const auto combinedItem = MakeCombinedValue(oldItem, newItem);
+         debugs(28, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: Merging overlapping " << newItem << " and " << oldItem << " into " << combinedItem <<
+                Debug::Extra << "advice: Replace values " << newItem << " and " << oldItem << " with " << combinedItem << " in the ACL");
++        Acl::NoteConfig("overlap", "'" + text(newItem) + "' and '" + text(oldItem) + "' overlap; Squid merges them into '" +
++                        text(combinedItem) + "'");
+         DestroyValue(newItem);
+         newItem = combinedItem;
+         storage.remove(oldItem, comparator);
 --- a/src/acl/Tree.cc
 +++ b/src/acl/Tree.cc
-@@ -60,9 +60,11 @@
+@@ -58,9 +58,11 @@
  bool
  Acl::Tree::bannedAction(ACLChecklist *checklist, Nodes::const_iterator node) const
  {
