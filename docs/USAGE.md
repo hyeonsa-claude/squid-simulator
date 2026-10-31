@@ -91,7 +91,7 @@ access_log daemon:/var/log/squid/access.log simulformat
 
 | 심각도 | 항목 | 판단 근거 |
 |---|---|---|
-| HIGH | `unreachable rule` | 앞 규칙의 ACL 집합이 이 규칙 ACL 집합의 부분집합이고 동작이 반대 |
+| HIGH | `unreachable rule` | 이 규칙에 매칭되는 요청은 모두 앞 규칙에도 매칭되고, 앞 규칙의 동작이 반대 (아래 "규칙 포함 판단") |
 | HIGH | `rule never matches` | `X`와 `!X`를 함께 요구, 또는 `!all` |
 | MEDIUM | `redundant rule` | 위와 같되 동작이 같음 (마지막 규칙이라 기본값을 바꾸면 LOW + "유지") |
 | MEDIUM | `built-in ACL redefined` | `all`, `manager`, `localhost`, `to_localhost`, `ssl::*` 재선언 |
@@ -100,9 +100,53 @@ access_log daemon:/var/log/squid/access.log simulformat
 | LOW | `covered by a wider entry` | `.example.com`이 `www.example.com`을, `10.0.0.0/8`이 `10.1.0.0/16`을 포함 |
 | LOW | `duplicate entry` | 같은 도메인·IP·정규식이 두 번 |
 | LOW | `unused ACL` | 어떤 지시어나 ACL도 참조하지 않음 |
-| LOW | `identical ACLs` | 타입·옵션·값이 같은 다른 이름 |
+| LOW | `identical ACLs` | 이름은 다르지만 같은 값에 매칭 (적은 순서·표기가 달라도 찾음: `port 80 443`과 `port 443 80`) |
+| LOW | `overlapping ACLs` | 같은 타입의 다른 ACL이 값 일부를 공유 (`10.1.200.0/24`가 `lab`과 `office`에 모두 있음). 공유 값 예시를 함께 표시 |
+| LOW | `partly shadowed rule` | 반대 동작의 앞 규칙과 ACL 값이 일부 겹쳐, 이 규칙에 매칭될 요청 중 일부를 앞 규칙이 먼저 판정 |
 | LOW | `repeated ACL in rule`, `redundant 'all'` | 한 규칙 안 반복, 다른 조건과 함께 쓴 `all` |
 | LOW | `no logged request matches` | 로그의 어떤 요청에도 매칭되지 않음 |
+| INFO | `ACL inside another ACL` | 한 ACL의 값이 모두 다른 ACL에 들어 있음 (`SSL_ports` ⊂ `Safe_ports`). 흔히 의도된 구성이라 참고용. 한 ACL 안에 6개 이상이 들어 있으면 한 줄로 묶음 |
+
+### 서로 다른 ACL 비교
+
+squid가 덤프하는 ACL 값을 읽어, **같은 타입**의 ACL끼리 값을 비교합니다.
+
+| 타입 | 비교 방법 |
+|---|---|
+| `src`, `dst`, `localip`(`myip`) | 주소 범위 (IPv4/IPv6, CIDR, `a-b` 범위, `all`) |
+| `port`, `localport`(`myport`) | 포트 범위 |
+| `dstdomain`, `srcdomain` | `.example.com`은 `example.com`과 모든 하위 도메인, 앞에 점이 없으면 그 이름만 |
+| `method`, `proto`, `myportname` | 값의 집합 |
+
+정규식(`url_regex`, `dstdom_regex` 등), `time`, 헤더·인증·helper 계열은 값으로 비교할 수 없어 대상이 아닙니다.
+`src`와 `dst`처럼 다른 타입은 같은 주소를 적었어도 요청의 다른 부분을 보므로 비교하지 않습니다.
+
+### 규칙 포함 판단
+
+뒤 규칙에 매칭되는 모든 요청이 앞 규칙에도 매칭되면, 뒤 규칙은 판정하지 못합니다. 앞 규칙의 조건 하나하나에 대해,
+뒤 규칙에 그것을 보장하는 조건이 있는지 확인합니다.
+
+| 앞 규칙 조건 | 뒤 규칙 조건 | 보장되는 경우 | 예 |
+|---|---|---|---|
+| `A` | `A` | 항상 | |
+| `A` | `B` | `B`의 값이 모두 `A`에 있음 | `deny news`(.news.example) 뒤의 `allow www_news`(www.news.example) |
+| `!A` | `!B` | `A`의 값이 모두 `B`에 있음 | `deny !office` 뒤의 `deny !localnet` |
+| `!A` | `B` | `A`와 `B`에 공통 값이 없음 | `deny !Safe_ports` 뒤의 `allow odd_port`(9000) |
+
+마지막 경우는 `dst`와 `srcdomain`에는 쓰지 않습니다. 한 요청이 여러 DNS 응답을 가지면 `A`와 `B`에 동시에 매칭될 수 있기 때문입니다.
+결과 메시지에 어떤 포함 관계로 판단했는지 함께 나옵니다.
+
+```text
+  HIGH    unreachable rule             http_access#2
+          every request it matches is decided first by http_access#1 [http_access deny news] with the opposite action ('www_news' is inside 'news')
+  LOW     overlapping ACLs             lab, office
+          'lab' and 'office' both match 10.1.200.0/24 (src) [acl office src 10.1.0.0/16]
+  LOW     partly shadowed rule         http_access#6
+          some requests it matches are decided first by http_access#5 [http_access deny lab] with the opposite action ('lab' and 'office' share 10.1.200.0/24)
+```
+
+`partly shadowed rule`은 앞 규칙의 모든 ACL이 이 규칙의 같은 타입 ACL과 값을 공유할 때만 보고합니다. 이 규칙의 다른 조건이 겹치는
+요청을 배제할 수도 있으므로 "겹칠 수 있음"으로 읽어 주세요.
 
 ## 정확도를 높이려면
 
