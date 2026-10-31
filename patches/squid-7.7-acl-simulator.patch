@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/AclSimulator.cci
-@@ -0,0 +1,1589 @@
+@@ -0,0 +1,1611 @@
 +/*
 + * Copyright (C) 1996-2020 The Squid Software Foundation and contributors
 + *
@@ -18,7 +18,8 @@
 + * Offline http_access simulator (squid --simulate access.log).
 + *
 + * Replays access.log lines written with
-+ *   logformat custom %tl %la %>a "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh
++ *   logformat simulformat %tl %la %>a "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh
++ * (fields are read by position, so the logformat name does not matter)
 + * through the http_access rules of the parsed squid.conf and reports, for
 + * every request, the deciding rule and every other rule that also matches.
 + * No sockets are opened and nothing is forwarded.
@@ -362,6 +363,22 @@
 +    return s;
 +}
 +
++/// a squid.conf line without its trailing "# comment" (ACL and rule lines only)
++static std::string
++ConfLine(const char *cfgline)
++{
++    std::string line = cfgline ? cfgline : "";
++    const auto hash = line.find(" #");
++    if (hash != std::string::npos)
++        line.erase(hash);
++    const auto tab = line.find("\t#");
++    if (tab != std::string::npos)
++        line.erase(tab);
++    while (!line.empty() && (line.back() == ' ' || line.back() == '\t'))
++        line.pop_back();
++    return line;
++}
++
 +static std::string
 +Paint(const std::string &s, const char *code)
 +{
@@ -458,7 +475,7 @@
 +            out << " " << leaf->node->name << "=" <<
 +                (WasSkipped(leaf->node) ? "?" : (leaf->result ? "yes" : "no"));
 +        }
-+        out << "   [" << (step.node->cfgline ? step.node->cfgline : "") << "]\n";
++        out << "   [" << ConfLine(step.node->cfgline) << "]\n";
 +        leaves.clear();
 +    }
 +    return out.str();
@@ -642,7 +659,7 @@
 +        RuleMatch m;
 +        m.name = winner->name.toStdString();
 +        m.action = answer.allowed() ? "allow" : (answer.denied() ? "deny" : "?");
-+        m.text = winner->cfgline ? winner->cfgline : "";
++        m.text = ConfLine(winner->cfgline);
 +        d.matches.push_back(m);
 +        if (m.action == "?")
 +            break; // exceptional answers (e.g., AUTH) end the check
@@ -660,7 +677,7 @@
 +    } else if (!firstAnswer.allowed() && !firstAnswer.denied() && lastEvaluated) {
 +        // an exceptional answer while this rule was being checked
 +        d.rule = lastEvaluated->name.toStdString();
-+        d.ruleText = lastEvaluated->cfgline ? lastEvaluated->cfgline : "";
++        d.ruleText = ConfLine(lastEvaluated->cfgline);
 +    } else {
 +        d.rule = "implicit";
 +        d.ruleText = "(no rule matched: opposite of the last rule's action)";
@@ -700,6 +717,11 @@
 +    f.where = where;
 +    f.message = message;
 +    f.fix = fix;
++    // a parser may report the same problem twice (e.g., splay tree re-comparisons)
++    for (const auto &old : run.findings) {
++        if (old.category == f.category && old.subject == f.subject && old.where == f.where && old.message == f.message)
++            return;
++    }
 +    run.findings.push_back(f);
 +}
 +
@@ -735,19 +757,19 @@
 +    // what the ACL parsers noticed
 +    for (const auto &note : Acl::ConfigNotes) {
 +        if (note.kind == "predefined")
-+            AddFinding(run, 2, "built-in ACL redefined", note.acl, note.where + "  " + note.line, note.message,
++            AddFinding(run, 2, "built-in ACL redefined", note.acl, note.where + "  " + ConfLine(note.line.c_str()), note.message,
 +                       "delete this acl line; Squid already defines '" + note.acl + "'");
 +        else if (note.kind == "covered")
-+            AddFinding(run, 1, "covered by a wider entry", note.acl, note.where + "  " + note.line, note.message,
++            AddFinding(run, 1, "covered by a wider entry", note.acl, note.where + "  " + ConfLine(note.line.c_str()), note.message,
 +                       "delete the narrower entry");
 +        else if (note.kind == "duplicate")
-+            AddFinding(run, 1, "duplicate entry", note.acl, note.where + "  " + note.line, note.message,
++            AddFinding(run, 1, "duplicate entry", note.acl, note.where + "  " + ConfLine(note.line.c_str()), note.message,
 +                       "delete the repeated entry");
 +        else if (note.kind == "universal")
-+            AddFinding(run, 2, "matches everything", note.acl, note.where + "  " + note.line, note.message,
++            AddFinding(run, 2, "matches everything", note.acl, note.where + "  " + ConfLine(note.line.c_str()), note.message,
 +                       "use the built-in 'all' ACL or remove the pattern");
 +        else if (note.kind == "overlap")
-+            AddFinding(run, 1, "overlapping entries", note.acl, note.where + "  " + note.line, note.message,
++            AddFinding(run, 1, "overlapping entries", note.acl, note.where + "  " + ConfLine(note.line.c_str()), note.message,
 +                       "replace the overlapping entries with the merged one");
 +    }
 +
@@ -758,7 +780,7 @@
 +        if (!a || Acl::PredefinedAcls.count(Lower(name)))
 +            continue;
 +        if (!Acl::AclReferences.count(Lower(name)))
-+            AddFinding(run, 1, "unused ACL", name, a->cfgline ? a->cfgline : "",
++            AddFinding(run, 1, "unused ACL", name, ConfLine(a->cfgline),
 +                       "defined, but no directive or other ACL uses it", "delete its acl line(s)");
 +        // "acl NAME TYPE OPTIONS VALUES" without "acl NAME"
 +        std::ostringstream whole;

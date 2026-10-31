@@ -35,6 +35,12 @@
 | `external` ACL | 자유 함수 | `ACLExternal::aclMatchExternal()` 멤버 | 같은 NULL 검사 위치에 추가 |
 | 컴파일 경고 | `-Wall -Wshadow -Werror` | `-Wextra -Wmissing-declarations -Wimplicit-fallthrough=5` 추가 | 새 함수는 모두 `static`이거나 헤더에 선언 |
 
+## 내장 ACL
+
+squid 7의 기본 설정은 `all`, `manager`, `localhost`, `to_localhost`, `to_linklocal`, `CONNECT`를 미리 정의합니다.
+4.10에 없던 `CONNECT`, `to_linklocal`을 squid.conf에서 다시 선언하면 `--optimize`가 `built-in ACL redefined`로 보고합니다.
+(Ubuntu 기본 squid.conf처럼 `acl CONNECT method CONNECT`를 그대로 두어도 동작은 같습니다.)
+
 ## 로그로 판단할 수 없는 ACL 타입
 
 7.7에서 `ident`, `ident_regex`가 제거되었고, 다음 타입이 `UNSURE` 목록에 추가되었습니다:

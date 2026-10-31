@@ -1,4 +1,4 @@
-# Test log: logformat custom %tl %la %>a  "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh
+# Test log: logformat simulformat %tl %la %>a  "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh
 # 31/Oct/2026 is a Saturday, 02/Nov/2026 a Monday. Times are proxy local time (+0900).
 02/Nov/2026:10:00:00 +0900 192.168.0.1 10.0.0.5  "GET http://www.example.com/ HTTP/1.1" 200 1024 TCP_MISS:HIER_DIRECT
 02/Nov/2026:10:00:01 +0900 192.168.0.1 10.0.0.5  "GET http://x.ads.example.com/a.js HTTP/1.1" 403 3500 TCP_DENIED:HIER_NONE
