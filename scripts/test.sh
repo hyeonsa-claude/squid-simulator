@@ -63,7 +63,8 @@ else
 fi
 
 # 4. optimizer findings (config:expected pairs; the second exists on branches that need it)
-for pair in squid.conf:expected-optimize.txt optimize-extra.conf:expected-optimize-extra.txt; do
+for pair in squid.conf:expected-optimize.txt optimize-overlap.conf:expected-optimize-overlap.txt \
+            optimize-extra.conf:expected-optimize-extra.txt; do
     conf=${pair%%:*} want=${pair##*:}
     [ -f "$T/$want" ] || continue
     echo "[optimize] --optimize ($conf)"

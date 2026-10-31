@@ -1,0 +1,12 @@
+# squid -f tests/optimize-overlap.conf --optimize
+# severity|category|subject (a regular expression matched against the finding line)
+HIGH|unreachable rule|http_access#2
+HIGH|unreachable rule|http_access#4
+MEDIUM|redundant rule|http_access#8
+MEDIUM|redundant rule|http_access#10
+LOW|partly shadowed rule|http_access#6
+LOW|overlapping ACLs|(office, lab|lab, office)
+LOW|overlapping ACLs|(news, sports|sports, news)
+LOW|identical ACLs|(ports_a, ports_b|ports_b, ports_a)
+INFO|ACL inside another ACL|office_a
+INFO|ACL inside another ACL|www_news

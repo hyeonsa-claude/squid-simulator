@@ -24,10 +24,11 @@
 | 매칭 규칙 목록 | 〃 | 차단 요청에서 뒤의 allow 규칙까지 표시 |
 | 설정 비교 | 〃 [compare] | 기대한 3줄(판정 변경 2, 규칙만 변경 1)만 변경으로 보고 |
 | 최적화 | 〃 [optimize] | 기대한 8개 항목 모두 보고 |
+| ACL 값 비교 | 〃 [optimize] (`tests/optimize-overlap.conf`) | 도메인·주소 포함으로 가려진 규칙, `!A` 뒤의 공통 값 없는 규칙, 부정 조건 포함, 일부 가려진 규칙, 겹치는 ACL, 표기만 다른 동일 ACL, 포함된 ACL 등 기대한 10개 항목 모두 보고 |
 | HTML 리포트 | 〃 [report] | 필수 섹션 모두 포함 |
 | 로그 형식 | 〃 [logformat] | `squid` 형식(자동 판별), gzip, squid-sim.conf에 정의한 형식으로 같은 요청을 재생해 simulformat과 판정이 한 줄도 다르지 않음 |
 
-`scripts/test.sh`의 33개 검사가 모두 통과했습니다. 테스트 로그는 시간 ACL(`02/Nov/2026` 월요일 10:00 +0900과
+`scripts/test.sh`의 43개 검사가 모두 통과했습니다. 테스트 로그는 시간 ACL(`02/Nov/2026` 월요일 10:00 +0900과
 `31/Oct/2026` 토요일), CONNECT, 비표준 포트, 헤더가 필요한 ACL(UNSURE), 파싱 불가 줄, 로그와 다른 판정(DIFF)을 포함합니다.
 테스트 서버의 타임존은 UTC여서, 시간 ACL 테스트는 로그의 +0900 오프셋을 따르는지도 함께 확인합니다.
 실제 squid(기본 설정, `squid` 형식 로그 179줄)도 설정 파일 없이 `sudo scripts/squid-sim`으로 형식을 자동 판별해 재생했고,
@@ -92,5 +93,5 @@ scripts/verify-target.sh        # OS·버전 확인 → 빌드 + make check → 
 | DNS | `dst`, `srcdomain`, IP URL의 `dstdomain` | `--sim-dns off`: UNSURE, `system`: 현재 DNS 결과 |
 | 다른 지시어 | `miss_access`, `adapted_http_access`, `ssl_bump`, `http_reply_access` | 대상 아님. 로그의 `TCP_DENIED`가 여기서 왔다면 DIFF |
 
-- 최적화의 도달 불가·중복 규칙 판단은 ACL 이름 집합 기준입니다. 서로 다른 ACL의 값이 겹치는 경우는 찾지 않습니다.
+- 최적화의 ACL 값 비교는 주소·포트·도메인·메서드·프로토콜·포트 이름 타입만 다룹니다. 정규식·`time`·헤더 계열은 이름이 같을 때만 같은 조건으로 봅니다.
 - 운영 squid.conf와 실제 운영 로그로 `DIFF` 비율을 확인하는 검증은 아직 하지 않았습니다. 테스트는 합성 설정과 로그로 했습니다.

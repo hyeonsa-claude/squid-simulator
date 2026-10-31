@@ -8,7 +8,7 @@ Squid 소스에 패치로 붙어서, 판정은 Squid 자신의 설정 파서와 
 |---|---|---|
 | 요청별 판정 | `--simulate access.log` | 판정한 규칙, 그 요청에 매칭되는 다른 규칙 전부, 그 규칙이 없었다면의 결과, 실제 로그와의 일치 여부 |
 | 설정 비교 | `--sim-compare new.conf` | 새 squid.conf로 바꾸면 판정이나 판정 규칙이 달라지는 요청 |
-| 최적화 | `--optimize` | 쓰이지 않는 ACL, 이미 포함된 값, 도달할 수 없거나 중복된 규칙, 내장 ACL 재정의 |
+| 최적화 | `--optimize` | 쓰이지 않는 ACL, 이미 포함된 값, 서로 겹치거나 포함되는 ACL, 도달할 수 없거나 중복·일부 가려진 규칙, 내장 ACL 재정의 |
 | 리포트 | `--report out.html` | 위 결과 전체를 담은 HTML 한 파일 (검색·필터, 규칙별 평가 과정) |
 | 캐시 매니저 | `squid-sim -m [--report 60m]` | 실행 중인 squid의 클라이언트, DNS 조회·실패, 진행 중 요청, 분당 요청을 localhost 같은 잡음 없이 조회하거나 기록 |
 
@@ -22,8 +22,8 @@ Squid 내부 API는 메이저 버전마다 달라서, 배포판의 squid 버전�
 
 | 브랜치 | 대상 OS | squid | 검증 |
 |---|---|---|---|
-| `main` | Ubuntu 20.04 LTS | 4.10 | Ubuntu 20.04.6에서 빌드·`make check` 94 PASS·기능 테스트 33개·배포판 squid 비교 통과 |
-| [`ubuntu-26.04-squid-7.7`](https://github.com/hyeonsa-claude/squid-simulator/tree/ubuntu-26.04-squid-7.7) | Ubuntu 26.04 LTS | 7.7 | Ubuntu 26.04.1에서 빌드·`make check` 103 PASS·기능 테스트 37개·배포판 squid 비교 통과 |
+| `main` | Ubuntu 20.04 LTS | 4.10 | Ubuntu 20.04.6에서 빌드·`make check` 94 PASS·기능 테스트 43개·배포판 squid 비교 통과 |
+| [`ubuntu-26.04-squid-7.7`](https://github.com/hyeonsa-claude/squid-simulator/tree/ubuntu-26.04-squid-7.7) | Ubuntu 26.04 LTS | 7.7 | Ubuntu 26.04.1에서 빌드·`make check` 103 PASS·기능 테스트 47개·배포판 squid 비교 통과 |
 
 ## 빠른 시작
 
@@ -263,7 +263,7 @@ squid 4.10을 root로 실행하면 설정 파싱 단계에서 `cache_log`에 한
 | DNS | `dst`, `srcdomain`, IP URL의 `dstdomain` | `--sim-dns off`: UNSURE / `system`: 지금의 DNS 결과 |
 
 - 대상은 `http_access`입니다. 로그의 `TCP_DENIED`가 `ssl_bump`, `miss_access` 등 다른 지시어에서 왔다면 `DIFF`로 나옵니다.
-- 최적화의 도달 불가·중복 규칙 판단은 ACL **이름** 기준입니다. 서로 다른 ACL의 값이 겹치는 경우는 찾지 않습니다.
+- 최적화는 같은 타입의 ACL 값(주소·포트·도메인·메서드 등)을 비교해 포함·겹침을 찾고, 규칙 포함 판단에도 씁니다. 정규식·`time`·헤더 계열 ACL은 값으로 비교할 수 없어 이름이 같을 때만 같은 조건으로 봅니다.
 
 ## 문서
 

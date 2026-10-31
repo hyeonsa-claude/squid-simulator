@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/AclSimulator.cci
-@@ -0,0 +1,1589 @@
+@@ -0,0 +1,2013 @@
 +/*
 + * Copyright (C) 1996-2020 The Squid Software Foundation and contributors
 + *
@@ -50,7 +50,9 @@
 +#include "tools.h"
 +
 +#include <algorithm>
++#include <arpa/inet.h>
 +#include <climits>
++#include <cstdint>
 +#include <cstdlib>
 +#include <cstring>
 +#include <ctime>
@@ -743,6 +745,318 @@
 +    return names;
 +}
 +
++/* comparing the values of different ACLs */
++
++typedef std::pair<uint64_t, uint64_t> Wide; ///< an IPv6 address (IPv4 as ::ffff:a.b.c.d) or a number
++typedef std::pair<Wide, Wide> WideRange; ///< inclusive
++
++/// what one ACL matches, comparable with another ACL of the same kind
++class AclValues
++{
++public:
++    std::string kind; ///< ACL type; empty when the values cannot be compared
++    std::vector<WideRange> ranges; ///< sorted, merged addresses or ports
++    std::set<std::string> domains; ///< ".example.com" also matches example.com and its subdomains
++    std::set<std::string> words; ///< methods, protocols, port names
++};
++
++static bool
++ParseWideAddress(std::string text, Wide &out, bool &v4)
++{
++    if (text.size() > 1 && text[0] == '[' && text[text.size() - 1] == ']')
++        text = text.substr(1, text.size() - 2);
++    unsigned char b[16];
++    memset(b, 0, sizeof(b));
++    struct in_addr a4;
++    struct in6_addr a6;
++    if (inet_pton(AF_INET, text.c_str(), &a4) == 1) {
++        b[10] = b[11] = 0xff;
++        memcpy(b + 12, &a4, 4);
++        v4 = true;
++    } else if (inet_pton(AF_INET6, text.c_str(), &a6) == 1) {
++        memcpy(b, &a6, 16);
++        v4 = false;
++    } else {
++        return false;
++    }
++    out = Wide(0, 0);
++    for (int i = 0; i < 8; ++i)
++        out.first = (out.first << 8) | b[i];
++    for (int i = 8; i < 16; ++i)
++        out.second = (out.second << 8) | b[i];
++    return true;
++}
++
++/// parses an IP ACL value as dumped: all, addr, addr-addr, with an optional /prefix
++static bool
++ParseIpValue(const std::string &item, WideRange &range)
++{
++    if (item == "all") {
++        range = WideRange(Wide(0, 0), Wide(~uint64_t(0), ~uint64_t(0)));
++        return true;
++    }
++    std::string text = item;
++    int prefix = -1;
++    const auto slash = text.find('/');
++    if (slash != std::string::npos) {
++        const std::string bits = text.substr(slash + 1);
++        if (bits.empty() || bits.find_first_not_of("0123456789") != std::string::npos)
++            return false;
++        prefix = atoi(bits.c_str());
++        text.resize(slash);
++    }
++    const auto dash = text.find('-');
++    bool v4first = false, v4last = false;
++    if (!ParseWideAddress(text.substr(0, dash), range.first, v4first) ||
++            !ParseWideAddress(dash == std::string::npos ? text : text.substr(dash + 1), range.second, v4last))
++        return false;
++    if (prefix >= 0) {
++        if (v4first)
++            prefix += 96;
++        if (prefix > 128)
++            return false;
++        // host bits of each 64-bit half
++        const auto hostBits = [](const int p, const int from) -> uint64_t {
++            if (p <= from)
++                return ~uint64_t(0);
++            if (p >= from + 64)
++                return 0;
++            return ~uint64_t(0) >> (p - from);
++        };
++        const uint64_t hi = hostBits(prefix, 0), lo = hostBits(prefix, 64);
++        range.first.first &= ~hi;
++        range.first.second &= ~lo;
++        range.second.first |= hi;
++        range.second.second |= lo;
++    }
++    return !(range.second < range.first);
++}
++
++static bool
++ParsePortValue(const std::string &item, WideRange &range)
++{
++    if (item.empty() || item.find_first_not_of("0123456789-") != std::string::npos)
++        return false;
++    const auto dash = item.find('-');
++    range.first = Wide(0, strtoull(item.c_str(), nullptr, 10));
++    range.second = dash == std::string::npos ? range.first : Wide(0, strtoull(item.c_str() + dash + 1, nullptr, 10));
++    return !(range.second < range.first);
++}
++
++static std::string
++WideText(const Wide &w, const std::string &kind)
++{
++    if (kind == "port" || kind == "localport")
++        return std::to_string(w.second);
++    unsigned char b[16];
++    for (int i = 0; i < 8; ++i) {
++        b[i] = (w.first >> (56 - 8 * i)) & 0xff;
++        b[8 + i] = (w.second >> (56 - 8 * i)) & 0xff;
++    }
++    char buf[INET6_ADDRSTRLEN];
++    if (w.first == 0 && (w.second >> 32) == 0xffff)
++        return inet_ntop(AF_INET, b + 12, buf, sizeof(buf)) ? buf : "?";
++    return inet_ntop(AF_INET6, b, buf, sizeof(buf)) ? buf : "?";
++}
++
++static std::string
++RangeText(const WideRange &r, const std::string &kind)
++{
++    const std::string first = WideText(r.first, kind);
++    if (r.first == r.second)
++        return first;
++    if (kind != "port" && kind != "localport") {
++        // an aligned block reads better as addr/prefix
++        const bool v4 = r.first.first == 0 && (r.first.second >> 32) == 0xffff;
++        for (int prefix = v4 ? 96 : 0; prefix < 128; ++prefix) {
++            const uint64_t hi = prefix >= 64 ? 0 : ~uint64_t(0) >> prefix;
++            const uint64_t lo = prefix <= 64 ? ~uint64_t(0) : ~uint64_t(0) >> (prefix - 64);
++            if ((r.first.first & hi) == 0 && (r.first.second & lo) == 0 &&
++                    (r.first.first | hi) == r.second.first && (r.first.second | lo) == r.second.second)
++                return first + "/" + std::to_string(v4 ? prefix - 96 : prefix);
++        }
++    }
++    return first + "-" + WideText(r.second, kind);
++}
++
++/// the values of an ACL whose type we can compare, as squid itself dumps them
++static AclValues
++ValuesOf(const ACL *acl)
++{
++    static const std::set<std::string> ipTypes = { "src", "dst", "localip" };
++    static const std::set<std::string> portTypes = { "port", "localport" };
++    static const std::set<std::string> domainTypes = { "dstdomain", "srcdomain" };
++    static const std::set<std::string> wordTypes = { "method", "proto", "myportname" };
++    AclValues v;
++    const std::string type = acl->typeString();
++    if (!ipTypes.count(type) && !portTypes.count(type) && !domainTypes.count(type) && !wordTypes.count(type))
++        return v;
++    std::vector<WideRange> ranges;
++    for (const auto &value : acl->dump()) {
++        const std::string item = value.toStdString();
++        WideRange range;
++        if (ipTypes.count(type) || portTypes.count(type)) {
++            if (!(ipTypes.count(type) ? ParseIpValue(item, range) : ParsePortValue(item, range)))
++                return AclValues(); // a value we do not understand: do not guess
++            ranges.push_back(range);
++        } else if (domainTypes.count(type)) {
++            v.domains.insert(Lower(item));
++        } else {
++            v.words.insert(type == "myportname" ? item : Upper(item));
++        }
++    }
++    std::sort(ranges.begin(), ranges.end());
++    for (const auto &r : ranges) {
++        if (!v.ranges.empty()) {
++            Wide next = v.ranges.back().second;
++            if (++next.second == 0)
++                ++next.first;
++            const bool atEnd = v.ranges.back().second == Wide(~uint64_t(0), ~uint64_t(0));
++            if (atEnd || !(next < r.first)) { // overlapping or adjacent
++                if (v.ranges.back().second < r.second)
++                    v.ranges.back().second = r.second;
++                continue;
++            }
++        }
++        v.ranges.push_back(r);
++    }
++    if (!v.ranges.empty() || !v.domains.empty() || !v.words.empty())
++        v.kind = type;
++    return v;
++}
++
++/// whether dstdomain value 'narrow' is matched by the value 'wide' in 'domains'
++static bool
++DomainCovered(const std::set<std::string> &domains, const std::string &narrow)
++{
++    if (narrow.empty() || domains.count(narrow))
++        return !narrow.empty();
++    if (narrow[0] != '.' && domains.count("." + narrow))
++        return true;
++    for (size_t dot = narrow.find('.', 1); dot != std::string::npos; dot = narrow.find('.', dot + 1)) {
++        if (domains.count(narrow.substr(dot)))
++            return true;
++    }
++    return false;
++}
++
++/// whether every request matching b also matches a
++static bool
++Covers(const AclValues &a, const AclValues &b)
++{
++    if (a.kind.empty() || a.kind != b.kind)
++        return false;
++    for (const auto &r : b.ranges) {
++        // merged ranges: a contiguous range in their union lies within one of them
++        auto it = std::upper_bound(a.ranges.begin(), a.ranges.end(), WideRange(r.first, Wide(~uint64_t(0), ~uint64_t(0))));
++        if (it == a.ranges.begin() || (--it)->second < r.second)
++            return false;
++    }
++    for (const auto &d : b.domains) {
++        if (!DomainCovered(a.domains, d))
++            return false;
++    }
++    for (const auto &w : b.words) {
++        if (!a.words.count(w))
++            return false;
++    }
++    return true;
++}
++
++/// values matched by both a and b (empty when they cannot overlap)
++static std::vector<std::string>
++Shared(const AclValues &a, const AclValues &b)
++{
++    std::vector<std::string> shared;
++    if (a.kind.empty() || a.kind != b.kind)
++        return shared;
++    for (const auto &x : a.ranges) {
++        for (const auto &y : b.ranges) {
++            const Wide first = std::max(x.first, y.first), last = std::min(x.second, y.second);
++            if (!(last < first))
++                shared.push_back(RangeText(WideRange(first, last), a.kind));
++        }
++    }
++    for (const auto &d : b.domains) {
++        if (DomainCovered(a.domains, d))
++            shared.push_back(d);
++    }
++    for (const auto &d : a.domains) {
++        if (DomainCovered(b.domains, d) && std::find(shared.begin(), shared.end(), d) == shared.end())
++            shared.push_back(d);
++    }
++    for (const auto &w : a.words) {
++        if (b.words.count(w))
++            shared.push_back(w);
++    }
++    return shared;
++}
++
++static std::string
++FirstValues(const std::vector<std::string> &values, const size_t limit = 3)
++{
++    std::string text;
++    for (size_t i = 0; i < values.size() && i < limit; ++i)
++        text += (i ? ", " : "") + values[i];
++    if (values.size() > limit)
++        text += ", ... (" + std::to_string(values.size()) + " in all)";
++    return text;
++}
++
++typedef std::map<std::string, AclValues> AclValueMap; ///< by lower-case ACL name
++
++/// whether a request matching rule condition 'narrow' ("name" or "!name") always matches 'wide'
++static bool
++Implies(const std::string &narrow, const std::string &wide, const AclValueMap &values, std::string &why)
++{
++    why.clear();
++    if (narrow == wide)
++        return true;
++    const bool narrowNot = narrow[0] == '!', wideNot = wide[0] == '!';
++    const std::string n = narrowNot ? narrow.substr(1) : narrow, w = wideNot ? wide.substr(1) : wide;
++    const auto nv = values.find(Lower(n)), wv = values.find(Lower(w));
++    if (nv == values.end() || wv == values.end())
++        return false;
++    if (!narrowNot && !wideNot && Covers(wv->second, nv->second)) {
++        why = "'" + n + "' is inside '" + w + "'";
++        return true;
++    }
++    if (narrowNot && wideNot && Covers(nv->second, wv->second)) {
++        why = "'" + w + "' is inside '" + n + "'";
++        return true;
++    }
++    // dst and srcdomain match when any of several DNS answers matches, so disjoint lists prove nothing
++    if (!narrowNot && wideNot && nv->second.kind == wv->second.kind && nv->second.kind != "dst" &&
++            nv->second.kind != "srcdomain" && Shared(nv->second, wv->second).empty()) {
++        why = "'" + n + "' has no value in common with '" + w + "'";
++        return true;
++    }
++    return false;
++}
++
++/// whether every request matching rule j's conditions also matches rule i's; explains the ACL inclusions used
++static bool
++RuleCovers(const std::set<std::string> &earlier, const std::set<std::string> &later, const AclValueMap &values,
++           std::string &why)
++{
++    why.clear();
++    for (const auto &wide : earlier) {
++        bool found = false;
++        for (const auto &narrow : later) {
++            std::string reason;
++            if (Implies(narrow, wide, values, reason)) {
++                if (!reason.empty())
++                    why += (why.empty() ? "" : "; ") + reason;
++                found = true;
++                break;
++            }
++        }
++        if (!found)
++            return false;
++    }
++    return true;
++}
++
 +/// finds unneeded or ineffective ACLs and http_access rules in the parsed squid.conf
 +static void
 +Analyze(ConfigRun &run)
@@ -776,14 +1090,79 @@
 +            options += option.toStdString() + " ";
 +        bySignature[std::string(a->typeString()) + " " + options + JoinDump(a)].push_back(a->name);
 +    }
++    std::set<std::pair<std::string, std::string> > sameText;
 +    for (const auto &entry : bySignature) {
 +        if (entry.second.size() < 2)
 +            continue;
 +        std::string names;
 +        for (const auto &name : entry.second)
 +            names += (names.empty() ? "" : ", ") + name;
++        for (const auto &x : entry.second) {
++            for (const auto &y : entry.second)
++                sameText.insert(std::make_pair(x, y));
++        }
 +        AddFinding(run, 1, "identical ACLs", names, entry.first,
 +                   "these ACLs have the same type and values", "keep one of them and use its name everywhere");
++    }
++
++    // different ACLs of one type whose values include or overlap each other
++    AclValueMap values;
++    std::vector<const ACL *> comparable;
++    for (const ACL *a = Config.aclList; a; a = a->next) {
++        AclValues v = ValuesOf(a);
++        if (v.kind.empty())
++            continue;
++        values[Lower(a->name)] = v;
++        if (!Acl::PredefinedAcls.count(a->name))
++            comparable.push_back(a);
++    }
++    std::map<const ACL *, std::vector<const ACL *> > inside; // wide ACL -> ACLs inside it
++    std::vector<const ACL *> insideOrder; // wide ACLs, in the order found
++    for (size_t i = 0; i < comparable.size(); ++i) {
++        for (size_t j = i + 1; j < comparable.size(); ++j) {
++            const ACL *a = comparable[i], *b = comparable[j];
++            const AclValues &va = values[Lower(a->name)], &vb = values[Lower(b->name)];
++            if (va.kind != vb.kind || sameText.count(std::make_pair(std::string(a->name), std::string(b->name))))
++                continue;
++            const bool aInB = Covers(vb, va), bInA = Covers(va, vb);
++            const std::string what = "(" + va.kind + ")";
++            if (aInB && bInA) {
++                AddFinding(run, 1, "identical ACLs", std::string(a->name) + ", " + b->name, ConfLine(a->cfgline),
++                           "written differently, but '" + std::string(a->name) + "' and '" + b->name +
++                           "' match the same values " + what,
++                           "keep one of them and use its name everywhere");
++            } else if (aInB || bInA) {
++                auto &list = inside[aInB ? b : a];
++                if (list.empty())
++                    insideOrder.push_back(aInB ? b : a);
++                list.push_back(aInB ? a : b);
++            } else {
++                const std::vector<std::string> both = Shared(va, vb);
++                if (!both.empty())
++                    AddFinding(run, 1, "overlapping ACLs", std::string(a->name) + ", " + b->name, ConfLine(a->cfgline),
++                               "'" + std::string(a->name) + "' and '" + b->name + "' both match " + FirstValues(both) + " " +
++                               what + " [" + ConfLine(b->cfgline) + "]",
++                               "check that requests matching both are meant to be treated alike");
++            }
++        }
++    }
++    static const char *insideFix = "fine when both are needed; check rules that list both or use them with opposite actions";
++    for (const ACL *wide : insideOrder) {
++        const std::vector<const ACL *> &narrows = inside[wide];
++        const std::string what = "(" + values[Lower(wide->name)].kind + ")";
++        if (narrows.size() <= 5) {
++            for (const ACL *narrow : narrows)
++                AddFinding(run, 0, "ACL inside another ACL", narrow->name, ConfLine(narrow->cfgline),
++                           "every value of '" + std::string(narrow->name) + "' is also in '" + wide->name + "' " + what +
++                           " [" + ConfLine(wide->cfgline) + "]", insideFix);
++            continue;
++        }
++        std::vector<std::string> names;
++        for (const ACL *narrow : narrows)
++            names.push_back(narrow->name);
++        AddFinding(run, 0, "ACL inside another ACL", FirstValues(names), ConfLine(wide->cfgline),
++                   std::to_string(names.size()) + " ACLs have only values that are also in '" + wide->name + "' " + what,
++                   insideFix);
 +    }
 +
 +    // http_access rules
@@ -822,7 +1201,9 @@
 +        }
 +    }
 +
-+    // a rule is dead when an earlier rule needs only a subset of its ACLs
++    // a rule is dead when every request it matches also matches an earlier rule: the earlier rule's ACLs
++    // are a subset of its ACLs, or are implied by them through the ACL values (www.example.com is inside
++    // .example.com; port 9000 is outside Safe_ports, so it matches !Safe_ports)
 +    bool unconditionalBefore = false; // an earlier rule matches every request
 +    for (size_t j = 0; j < count; ++j) {
 +        if (impossible[j])
@@ -830,9 +1211,11 @@
 +        const bool unconditional = conditions[j].empty();
 +        const RuleInfo &rule = run.rules[j];
 +        for (size_t i = 0; i < j; ++i) {
-+            if (impossible[i] || !std::includes(conditions[j].begin(), conditions[j].end(),
-+                                                conditions[i].begin(), conditions[i].end()))
++            std::string why;
++            if (impossible[i] || !RuleCovers(conditions[i], conditions[j], values, why))
 +                continue;
++            if (!why.empty())
++                why = " (" + why + ")";
 +            const RuleInfo &earlier = run.rules[i];
 +            reported[j] = true;
 +            // the implicit default matters only if some request can reach it
@@ -841,19 +1224,60 @@
 +            if (earlier.action == rule.action && setsDefault)
 +                AddFinding(run, 1, "redundant rule", rule.name, rule.text,
 +                           "every request it matches is already matched by " + earlier.name + " [" + earlier.text +
-+                           "] with the same action",
++                           "] with the same action" + why,
 +                           "keep it anyway: as the last rule it makes unmatched requests " + ImplicitVerdict(run));
 +            else if (earlier.action == rule.action)
 +                AddFinding(run, 2, "redundant rule", rule.name, rule.text,
 +                           "every request it matches is already matched by " + earlier.name + " [" + earlier.text +
-+                           "] with the same action", "delete this rule");
++                           "] with the same action" + why, "delete this rule");
 +            else
 +                AddFinding(run, 3, "unreachable rule", rule.name, rule.text,
 +                           "every request it matches is decided first by " + earlier.name + " [" + earlier.text +
-+                           "] with the opposite action", "move it above " + earlier.name + " or delete it");
++                           "] with the opposite action" + why, "move it above " + earlier.name + " or delete it");
 +            break;
 +        }
 +        unconditionalBefore = unconditionalBefore || unconditional;
++    }
++
++    // a rule partly taken by an earlier rule with the opposite action: each of the earlier rule's ACLs
++    // shares values with an ACL of the same type in this rule
++    for (size_t j = 0; j < count; ++j) {
++        if (impossible[j] || reported[j])
++            continue;
++        const RuleInfo &rule = run.rules[j];
++        for (size_t i = 0; i < j; ++i) {
++            const RuleInfo &earlier = run.rules[i];
++            if (impossible[i] || conditions[i].empty() || earlier.action == rule.action)
++                continue;
++            std::string overlap;
++            for (const auto &wide : conditions[i]) {
++                std::string found;
++                for (const auto &narrow : conditions[j]) {
++                    if (wide[0] == '!' || narrow[0] == '!')
++                        continue;
++                    const auto wv = values.find(Lower(wide)), nv = values.find(Lower(narrow));
++                    if (wv == values.end() || nv == values.end())
++                        continue;
++                    const std::vector<std::string> both = Shared(wv->second, nv->second);
++                    if (!both.empty()) {
++                        found = "'" + wide + "' and '" + narrow + "' share " + FirstValues(both, 2);
++                        break;
++                    }
++                }
++                if (found.empty()) {
++                    overlap.clear();
++                    break;
++                }
++                overlap += (overlap.empty() ? "" : "; ") + found;
++            }
++            if (overlap.empty())
++                continue;
++            AddFinding(run, 1, "partly shadowed rule", rule.name, rule.text,
++                       "some requests it matches are decided first by " + earlier.name + " [" + earlier.text +
++                       "] with the opposite action (" + overlap + ")",
++                       "check the order, or narrow one of the ACLs if the overlap is unintended");
++            break;
++        }
 +    }
 +
 +    // what the replayed log shows
@@ -882,7 +1306,7 @@
 +static const char *
 +SeverityName(const int severity)
 +{
-+    return severity >= 3 ? "HIGH" : (severity == 2 ? "MEDIUM" : "LOW");
++    return severity >= 3 ? "HIGH" : (severity == 2 ? "MEDIUM" : (severity == 1 ? "LOW" : "INFO"));
 +}
 +
 +/* terminal output */
@@ -892,7 +1316,7 @@
 +{
 +    std::cout << "\n# optimize " << label << "squid.conf: " << run.path << " (" << run.findings.size() << " findings)\n";
 +    for (const auto &f : run.findings) {
-+        const char *color = f.severity >= 3 ? "1;31" : (f.severity == 2 ? "1;33" : "36");
++        const char *color = f.severity >= 3 ? "1;31" : (f.severity == 2 ? "1;33" : (f.severity == 1 ? "36" : "2"));
 +        std::cout << "  " << Paint(Pad(SeverityName(f.severity), 6), color) << "  " << Pad(f.category, 27) <<
 +                  "  " << f.subject << "\n" <<
 +                  "          " << f.message << "\n";
@@ -1364,7 +1788,7 @@
 +        ".pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.03em}"
 +        ".pill.allow{background:var(--allow-bg);color:var(--allow)}.pill.deny{background:var(--deny-bg);color:var(--deny)}"
 +        ".pill.auth,.pill.dunno,.pill.skip,.pill.medium{background:var(--warn-bg);color:var(--warn)}"
-+        ".pill.high{background:var(--deny-bg);color:var(--deny)}.pill.low{background:var(--line);color:var(--muted)}"
++        ".pill.high{background:var(--deny-bg);color:var(--deny)}.pill.low,.pill.info{background:var(--line);color:var(--muted)}"
 +        ".tag{font-size:11px;border:1px solid var(--accent);color:var(--accent);border-radius:4px;padding:0 5px;margin-left:4px;font-family:system-ui}"
 +        ".tag.muted{border-color:var(--line);color:var(--muted)}.barcol{width:22%}.bar{height:8px;background:var(--line);border-radius:4px;overflow:hidden;margin-top:6px}"
 +        ".bar span{display:block;height:100%;background:var(--muted)}.bar.allow span{background:var(--allow)}.bar.deny span{background:var(--deny)}"
