@@ -3,6 +3,13 @@
 
 Simulator (runs the patched squid binary built by scripts/build.sh; options pass through):
   squid-sim -f /etc/squid/squid.conf --simulate access.log [--sim-compare new.conf] [--optimize] [--report out.html]
+  squid-sim                                   uses squid_conf and access_log from squid-sim.conf
+  squid-sim --convert access.log              print the log converted to simulformat
+
+The log may use any squid logformat. squid-sim.conf (--sim-conf FILE, $SQUID_SIM_CONF,
+/etc/squid/squid-sim.conf, or squid-sim.conf next to scripts/) says which one; by default the
+format is detected from the log, trying the format squid.conf's access_log writes first.
+squid-sim converts other formats to simulformat before squid reads them (.gz logs too).
 
 Cache manager of a running squid (read-only HTTP GETs to /squid-internal-mgr/):
   squid-sim --manager                         filtered snapshot of the main pages
@@ -17,15 +24,20 @@ Python 3.8+ standard library only.
 
 import argparse
 import base64
+import calendar
 import datetime
 import glob
+import gzip
 import html
 import ipaddress
 import json
 import os
 import re
+import shutil
 import signal
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -607,6 +619,354 @@ th{font-size:12px;color:var(--muted)}tbody tr:last-child td{border-bottom:0}.num
         f.write(doc)
 
 
+# ---------------------------------------------------------------- simulator configuration (squid-sim.conf)
+
+SIM_CONF_DEFAULTS = {
+    "squid_conf": "/etc/squid/squid.conf",
+    "access_log": "auto",       # auto = the first file access_log of squid_conf
+    "log_format": "auto",       # auto = detect; or a logformat name
+    "local_ip": "auto",         # %la when the format has none; auto = http_port address, if any
+    "log_timezone": "local",    # offset for %ts/%tg times: local or +0900
+    "sim_port": "auto",         # --sim-port
+    "sim_dns": "auto",          # --sim-dns off|system
+    "manager_url": "auto",      # --manager --url
+    "manager_password_env": "",  # --manager --password-env
+}
+
+
+class SimConf:
+    def __init__(self, path=None):
+        self.path = path
+        self.settings = dict(SIM_CONF_DEFAULTS)
+        self.formats = {}  # logformat lines of squid-sim.conf, in order
+        if path:
+            self.read(path)
+
+    def read(self, path):
+        try:
+            f = open(path, encoding="utf-8", errors="replace")
+        except OSError as e:
+            sys.exit("squid-sim: cannot read %s: %s" % (path, e))
+        with f:
+            for number, raw in enumerate(f, 1):
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                words = line.split(None, 2)
+                key = words[0]
+                if key == "logformat":
+                    if len(words) < 3:
+                        sys.exit("squid-sim: %s:%d: logformat needs a name and a format" % (path, number))
+                    self.formats[words[1]] = words[2]
+                    continue
+                if key not in SIM_CONF_DEFAULTS or len(words) < 2:
+                    sys.exit("squid-sim: %s:%d: unknown or incomplete directive: %s" % (path, number, line))
+                # values are single words; anything after them is a comment
+                value = words[1]
+                if key in ("squid_conf", "access_log") and value != "auto" and not os.path.isabs(value):
+                    value = os.path.join(os.path.dirname(os.path.abspath(path)), value)
+                self.settings[key] = value
+
+    def get(self, key):
+        value = self.settings[key]
+        return None if value in ("auto", "") else value
+
+
+def find_sim_conf(explicit):
+    if explicit:
+        return explicit
+    for path in (os.environ.get("SQUID_SIM_CONF"), "/etc/squid/squid-sim.conf", os.path.join(ROOT, "squid-sim.conf")):
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+class SquidConf:
+    """the parts of squid.conf that describe its access.log"""
+
+    def __init__(self, path):
+        self.path = path
+        self.formats = {}
+        self.logs = []  # (file, format name or None)
+        self.has_access_log = False
+        self.port_ip = None
+        self.uses_local_ip = False
+        try:
+            f = open(path, encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        with f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                words = line.split()
+                if words[0] == "logformat" and len(words) >= 3:
+                    self.formats[words[1]] = line.split(None, 2)[2]
+                elif words[0] == "access_log" and len(words) >= 2:
+                    self.has_access_log = True
+                    if words[1] == "none":
+                        continue
+                    name = next((w.split("=", 1)[1] for w in words[2:] if w.startswith("logformat=")), None)
+                    if name is None and len(words) >= 3 and "=" not in words[2]:
+                        name = words[2]  # access_log FILE FORMAT [acl ...]; checked later
+                    self.logs.append((words[1], name))
+                elif words[0] == "http_port" and len(words) >= 2 and self.port_ip is None:
+                    m = re.match(r"^\[?([0-9a-fA-F.:]+?)\]?:\d+$", words[1])
+                    if m and is_ip_literal(m.group(1)) and not ipaddress.ip_address(m.group(1)).is_unspecified:
+                        self.port_ip = m.group(1)
+                elif words[0] == "acl" and len(words) >= 3 and words[2] in ("localip", "myip"):
+                    self.uses_local_ip = True
+
+    def log_file(self):
+        """first access_log that is a local file; without access_log lines, squid's default"""
+        if not self.has_access_log and os.path.isfile(self.path):
+            return DEFAULT_ACCESS_LOG
+        for place, _ in self.logs:
+            if place.startswith(("daemon:", "stdio:")):
+                place = place.split(":", 1)[1]
+            if place.startswith("/"):
+                return place
+        return None
+
+    def log_format(self):
+        """format name of the first access_log; squid's default is 'squid'"""
+        if not self.has_access_log and os.path.isfile(self.path):
+            return "squid"
+        for _, name in self.logs:
+            return name if name and (name in self.formats or name in BUILTIN_FORMATS) else "squid"
+        return None
+
+
+# ---------------------------------------------------------------- log formats
+
+SIMULFORMAT = '%tl %la %>a "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh'
+DEFAULT_ACCESS_LOG = "/var/log/squid/access.log"  # squid's default (Debian/Ubuntu --with-logdir)
+# squid's predefined logformats (src/log/FormatSquid*.cc), plus the simulator's own
+BUILTIN_FORMATS = {
+    "simulformat": SIMULFORMAT,
+    "squid": "%ts.%03tu %6tr %>a %Ss/%03>Hs %<st %rm %ru %[un %Sh/%<a %mt",
+    "common": '%>a %[ui %[un [%tl] "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh',
+    "combined": '%>a %[ui %[un [%tl] "%rm %ru HTTP/%rv" %>Hs %<st "%{Referer}>h" "%{User-Agent}>h" %Ss:%Sh',
+    "referrer": "%ts.%03tu %>a %{Referer}>h %ru",
+}
+# format codes, so that "%Ss/%03>Hs" splits into Ss, "/", >Hs; unknown codes fall back to FALLBACK_CODE
+KNOWN_CODES = sorted("""
+    >a >A >p >la >lp >eui >qos >nfmark la lp <a <A <p <la <lp <qos <nfmark
+    ts tu tl tg tr tt dt tS tR busy_time rm ru rp rv rG >rm >ru >rp >rv >rs >rd >rP >rdp <rm <ru <rp <rv <rs <rd <rP
+    Ss Sh Hs >Hs <Hs <pt <tt <bs >bs <st >st <sh >sh st mt ea un ul ui uj ue us et sn err_code err_detail note
+    >h <h >ha <ha master_xaction ssl::bump_mode ssl::>sni ssl::>cert_subject ssl::>cert_issuer
+    ssl::<cert_subject ssl::<cert_issuer ssl::<cert_errors ssl::>negotiated_version ssl::<negotiated_version
+    ssl::>received_hello_version ssl::<received_hello_version ssl::>received_supported_version
+    ssl::<received_supported_version ssl::>negotiated_cipher ssl::<negotiated_cipher ssl::<cert
+    proxy_protocol::>h icap::tt icap::<last_h adapt::<last_h adapt::sum_trs adapt::all_trs
+""".split(), key=len, reverse=True)
+FIELD_PREFIX = re.compile(r'%([-"\[#\'/]*)(0?\d+)?(?:\.\d+)?(\{[^}]*\})?')
+FALLBACK_CODE = re.compile(r"(?:[a-z_]+::)?[<>]?[A-Za-z_]+")
+ARGUMENT = re.compile(r"\{[^}]*\}")
+# what each code feeds into the simulformat line
+ROLES = {"tl": "tl", "tg": "tg", "ts": "ts", "la": "la", ">la": "la", ">a": "client", "rm": "method", ">rm": "method",
+         "ru": "url", ">ru": "url", "rv": "version", ">rv": "version", ">Hs": "status", "Hs": "status",
+         "<st": "size", "st": "size", "Ss": "ss", "Sh": "sh"}
+DATE = r"\d{1,2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4}"
+NUMERIC = {"ts", "tu", "tr", "tt", "dt", "<pt", "<tt", "<st", ">st", "st", "<sh", ">sh", "<bs", ">bs"}
+MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def parse_format(spec):
+    """logformat text -> [("lit", text) | ("field", code, quoted, padded)]"""
+    items, lit, i = [], "", 0
+    while i < len(spec):
+        if spec[i] != "%":
+            lit += spec[i]
+            i += 1
+            continue
+        if spec.startswith("%%", i):
+            lit += "%"
+            i += 2
+            continue
+        prefix = FIELD_PREFIX.match(spec, i)
+        j = prefix.end()
+        code = next((c for c in KNOWN_CODES if spec.startswith(c, j)), None)
+        if code is None:
+            m = FALLBACK_CODE.match(spec, j)
+            if not m:
+                raise ValueError("cannot read the format code at %r" % spec[i:i + 12])
+            code = m.group(0)
+        j += len(code)
+        arg = ARGUMENT.match(spec, j)
+        if arg:
+            j = arg.end()
+        if lit:
+            items.append(("lit", lit))
+            lit = ""
+        items.append(("field", code, '"' in prefix.group(1), bool(prefix.group(2))))
+        i = j
+    if lit:
+        items.append(("lit", lit))
+    return items
+
+
+class LogFormat:
+    """matches lines of one logformat and rewrites them as simulformat"""
+
+    def __init__(self, name, spec, local_ip=None, timezone="local"):
+        self.name, self.spec = name, spec
+        self.local_ip = local_ip or "-"
+        self.timezone = timezone
+        items = parse_format(spec)
+        parts, self.roles = [], []
+        for k, item in enumerate(items):
+            if item[0] == "lit":
+                text = item[1]
+                chunks = re.split(r"(\s+)", text)
+                parts.append("".join(r"\s+" if c.isspace() else re.escape(c) for c in chunks if c))
+                continue
+            _, code, quoted, padded = item
+            before = items[k - 1][1] if k and items[k - 1][0] == "lit" else ""
+            after = items[k + 1][1] if k + 1 < len(items) and items[k + 1][0] == "lit" else ""
+            if quoted:
+                value = r'"(?:[^"\\]|\\.)*"'
+            elif code in ("tl", "tg"):
+                value = DATE
+            elif code in NUMERIC:
+                value = r"-|-?\d+"
+            elif before.endswith('"') and after.startswith('"'):
+                value = r'[^"]*'
+            elif after and not after[0].isspace():
+                value = r"[^\s%s]+" % re.escape(after[0])
+            else:
+                value = r"\S+"
+            role = ROLES.get(code)
+            if role:
+                self.roles.append(role)
+            parts.append((r"\s*" if padded else "") + ("(%s)" if role else "(?:%s)") % value)
+        self.regex = re.compile("^" + "".join(parts) + r"\s*$")
+        have = set(self.roles)
+        self.missing = [code for code, role in (("%>a", "client"), ("%ru", "url")) if role not in have]
+        self.has_local_ip = "la" in have
+        self.has_time = bool(have & {"tl", "tg", "ts"})
+        self.passthrough = " ".join(spec.split()) == SIMULFORMAT
+
+    def local_time(self, epoch):
+        if self.timezone == "local":
+            tm = time.localtime(epoch)
+            offset = tm.tm_gmtoff
+        else:
+            m = re.fullmatch(r"([+-])(\d\d):?(\d\d)", self.timezone)
+            if not m:
+                sys.exit("squid-sim: log_timezone must be local or like +0900, not %r" % self.timezone)
+            offset = (1 if m.group(1) == "+" else -1) * (int(m.group(2)) * 3600 + int(m.group(3)) * 60)
+            tm = time.gmtime(epoch + offset)
+        sign = "-" if offset < 0 else "+"
+        return "%02d/%s/%04d:%02d:%02d:%02d %s%02d%02d" % (
+            tm.tm_mday, MONTHS[tm.tm_mon - 1], tm.tm_year, tm.tm_hour, tm.tm_min, tm.tm_sec,
+            sign, abs(offset) // 3600, abs(offset) % 3600 // 60)
+
+    def convert(self, line):
+        """simulformat line, or None when the line does not match"""
+        m = self.regex.match(line)
+        if not m:
+            return None
+        v = {}
+        for role, value in zip(self.roles, m.groups()):
+            if value is None:
+                continue
+            if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+                value = value[1:-1]
+            v.setdefault(role, value)
+        if "tl" in v:
+            when = v["tl"]
+        elif "tg" in v:
+            d = re.match(r"(\d+)/(\w+)/(\d+):(\d+):(\d+):(\d+)", v["tg"])
+            epoch = calendar.timegm((int(d.group(3)), MONTHS.index(d.group(2).title()) + 1, int(d.group(1)),
+                                     int(d.group(4)), int(d.group(5)), int(d.group(6))))
+            when = self.local_time(epoch)
+        elif v.get("ts", "-").isdigit():
+            when = self.local_time(int(v["ts"]))
+        else:
+            when = "- -"
+        url = v.get("url", "-")
+        method = v.get("method") or ("GET" if "://" in url else "CONNECT")
+        return '%s %s %s "%s %s HTTP/%s" %s %s %s:%s' % (
+            when, v.get("la", self.local_ip), v.get("client", "-"), method, url, v.get("version", "1.1"),
+            v.get("status", "-"), v.get("size", "-"), v.get("ss", "-"), v.get("sh", "-"))
+
+
+def open_log(path):
+    if path == "-":
+        return sys.stdin
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return open(path, encoding="utf-8", errors="replace")
+
+
+def sample_lines(path, count=50):
+    lines = []
+    with open_log(path) as f:
+        for line in f:
+            line = line.rstrip("\r\n")
+            if line and not line.startswith("#"):
+                lines.append(line)
+                if len(lines) >= count:
+                    break
+    return lines
+
+
+def choose_format(log, sim, squid):
+    """(LogFormat, how it was chosen) for the log file"""
+    formats = {}
+    for source in (BUILTIN_FORMATS, squid.formats, sim.formats):
+        formats.update(source)  # squid-sim.conf wins over squid.conf, which wins over built-ins
+    local_ip = sim.get("local_ip") or squid.port_ip
+    tz = sim.settings["log_timezone"]
+    wanted = sim.get("log_format")
+    if wanted:
+        if wanted not in formats:
+            sys.exit("squid-sim: log_format %s is not defined (known: %s)" % (wanted, ", ".join(sorted(formats))))
+        return LogFormat(wanted, formats[wanted], local_ip, tz), "log_format in %s" % sim.path
+
+    declared = squid.log_format()
+    order = ([declared] if declared else []) + list(sim.formats) + list(squid.formats) + list(BUILTIN_FORMATS)
+    lines = sample_lines(log)
+    best, best_hits = None, -1
+    for name in dict.fromkeys(order):
+        try:
+            fmt = LogFormat(name, formats[name], local_ip, tz)
+        except ValueError:
+            continue
+        if fmt.missing:
+            continue
+        hits = sum(1 for line in lines if fmt.regex.match(line))
+        if hits > best_hits:
+            best, best_hits = fmt, hits
+    if not lines:
+        return LogFormat("simulformat", SIMULFORMAT), "empty log"
+    if best is None or best_hits == 0:
+        sys.exit("squid-sim: no known logformat matches %s; add its logformat line to squid-sim.conf "
+                 "and set log_format (tried: %s)" % (log, ", ".join(dict.fromkeys(order))))
+    return best, "detected, %d of %d sample lines match" % (best_hits, len(lines))
+
+
+def convert_log(path, fmt, out):
+    """writes simulformat lines; keeps comments and line numbers, unreadable lines stay unreadable"""
+    converted = unmatched = 0
+    with open_log(path) as f:
+        for line in f:
+            line = line.rstrip("\r\n")
+            if not line or line.startswith("#"):
+                out.write(line + "\n")
+                continue
+            new = fmt.convert(line)
+            if new is None:
+                unmatched += 1
+                new = line.replace('"', "'")  # no quotes: squid reports it as an unparsed line
+            else:
+                converted += 1
+            out.write(new + "\n")
+    return converted, unmatched
+
+
 # ---------------------------------------------------------------- simulator pass-through
 
 def find_binary(explicit):
@@ -618,14 +978,104 @@ def find_binary(explicit):
     return found[-1] if found else None
 
 
+def take_option(argv, names, has_value=True):
+    """removes --name VALUE / --name=VALUE from argv; returns the value (True for flags) or None"""
+    for i, a in enumerate(argv):
+        for name in names:
+            if a == name:
+                if not has_value:
+                    del argv[i]
+                    return True
+                if i + 1 >= len(argv):
+                    sys.exit("squid-sim: %s needs a value" % name)
+                value = argv[i + 1]
+                del argv[i:i + 2]
+                return value
+            if has_value and name.startswith("--") and a.startswith(name + "="):
+                del argv[i]
+                return a.split("=", 1)[1]
+    return None
+
+
+def peek_option(argv, names):
+    for i, a in enumerate(argv):
+        for name in names:
+            if a == name and i + 1 < len(argv):
+                return argv[i + 1]
+            if name.startswith("--") and a.startswith(name + "="):
+                return a.split("=", 1)[1]
+    return None
+
+
 def run_simulator(argv):
-    binary = None
-    if argv[:1] == ["--binary"] and len(argv) >= 2:
-        binary, argv = argv[1], argv[2:]
+    argv = list(argv)
+    binary = take_option(argv, ["--binary"])
+    sim = SimConf(find_sim_conf(take_option(argv, ["--sim-conf"])))
+    forced_format = take_option(argv, ["--log-format"])
+    if forced_format:
+        sim.settings["log_format"] = forced_format
+    convert_only = take_option(argv, ["--convert"])
+
+    squid_conf = peek_option(argv, ["-f"]) or sim.settings["squid_conf"]
+    squid = SquidConf(squid_conf)
+    log = convert_only or peek_option(argv, ["--simulate"])
+    if log is None and not convert_only and "--optimize" not in argv:
+        log = sim.get("access_log") or squid.log_file()
+        if not log:
+            sys.exit("squid-sim: no log to replay; pass --simulate FILE or set access_log in squid-sim.conf")
+        argv += ["--simulate", log]
+    if "-f" not in argv:
+        argv = ["-f", squid_conf] + argv
+    for key, option in (("sim_port", "--sim-port"), ("sim_dns", "--sim-dns")):
+        if sim.get(key) and peek_option(argv, [option]) is None:
+            argv += [option, sim.get(key)]
+
+    fmt = None
+    if log:
+        if log != "-" and not os.path.isfile(log):
+            sys.exit("squid-sim: cannot open %s" % log)
+        fmt, how = choose_format(log, sim, squid)
+        if fmt.missing:
+            sys.exit("squid-sim: logformat %s has no %s; the simulator needs the client address and URL"
+                     % (fmt.name, " or ".join(fmt.missing)))
+        print("squid-sim: %s is logformat %s (%s)" % (log, fmt.name, how), file=sys.stderr)
+        if not fmt.has_local_ip and squid.uses_local_ip and fmt.local_ip == "-":
+            print("squid-sim: warning: the log has no %la and squid.conf uses localip/myip ACLs; "
+                  "set local_ip in squid-sim.conf", file=sys.stderr)
+        if not fmt.has_time:
+            print("squid-sim: warning: the log has no time; time ACLs use the current time", file=sys.stderr)
+
+    if convert_only:
+        converted, unmatched = convert_log(convert_only, fmt, sys.stdout)
+        print("squid-sim: %d lines converted, %d did not match" % (converted, unmatched), file=sys.stderr)
+        return 0
+
     binary = find_binary(binary)
     if not binary or not os.access(binary, os.X_OK):
         sys.exit("squid-sim: patched squid not found; run scripts/build.sh or pass --binary PATH")
-    os.execv(binary, [binary] + argv)
+    sys.stdout.flush()
+    sys.stderr.flush()  # block-buffered when redirected on Python < 3.9; exec would drop it
+    if not fmt or (fmt.passthrough and log != "-" and not log.endswith(".gz")):
+        os.execv(binary, [binary] + argv)
+
+    # other formats: replay a simulformat copy (named like the original, in a private temp directory)
+    tmp = tempfile.mkdtemp(prefix="squid-sim-")
+    try:
+        name = "stdin.log" if log == "-" else re.sub(r"\.gz$", "", os.path.basename(log))
+        copy = os.path.join(tmp, name)
+        with open(copy, "w", encoding="utf-8") as out:
+            converted, unmatched = convert_log(log, fmt, out)
+        print("squid-sim: converted %d lines to simulformat (%d did not match and are reported as skipped)"
+              % (converted, unmatched), file=sys.stderr)
+        for i, a in enumerate(argv):
+            if a == "--simulate":
+                argv[i + 1] = copy
+            elif a.startswith("--simulate="):
+                argv[i] = "--simulate=" + copy
+        sys.stderr.flush()
+        return subprocess.call([binary] + argv)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- main
@@ -633,16 +1083,18 @@ def run_simulator(argv):
 def main():
     argv = sys.argv[1:]
     if not any(a in ("--manager", "-m") for a in argv):
-        if not argv or argv[0] in ("-h", "--help"):
+        if argv and argv[0] in ("-h", "--help"):
             print(__doc__.strip())
             return 0
-        run_simulator(argv)
+        return run_simulator(argv)
+
+    sim = SimConf(find_sim_conf(take_option(argv, ["--sim-conf"])))
 
     p = argparse.ArgumentParser(prog="squid-sim --manager",
                                 description="Query or record the cache manager of a running squid (read-only).")
     p.add_argument("--manager", "-m", action="store_true", help="cache manager mode")
     p.add_argument("--url", help="squid address, e.g. http://127.0.0.1:8090 (default: first http_port of --conf)")
-    p.add_argument("--conf", default="/etc/squid/squid.conf", help="squid.conf used to guess --url")
+    p.add_argument("--conf", default=sim.settings["squid_conf"], help="squid.conf used to guess --url")
     p.add_argument("--page", action="append", help="page(s) to show, e.g. ipcache (repeat or comma-separate)")
     p.add_argument("--raw", action="store_true", help="print pages exactly as squid returns them")
     p.add_argument("--report", type=parse_duration, metavar="DURATION",
@@ -657,8 +1109,9 @@ def main():
     if args.interval < 1:
         p.error("--interval must be at least 1s")
 
-    base = args.url or first_http_port(args.conf)
-    password = os.environ.get(args.password_env) if args.password_env else None
+    base = args.url or sim.get("manager_url") or first_http_port(args.conf)
+    password_env = args.password_env or sim.get("manager_password_env")
+    password = os.environ.get(password_env) if password_env else None
     mgr = Manager(base, password, args.timeout)
     pages = []
     for item in args.page or []:

@@ -108,6 +108,9 @@ Squid는 첫 매칭에서 멈추므로, 뒤에서 허용했을 규칙을 알려�
 
 시뮬레이터 바깥의 `scripts/squid-sim`은 Python 스크립트로, 패치한 squid를 실행하는 진입점이자 실행 중인 squid의 캐시 매니저
 (`/squid-internal-mgr/`)를 읽는 도구입니다. 캐시 매니저 쪽은 Squid 소스를 고치지 않고 HTTP GET만 씁니다 ([MANAGER.md](MANAGER.md)).
+로그 형식도 여기서 처리합니다. `squid-sim.conf`의 `logformat`(squid 문법)을 정규식으로 바꿔 로그를 판별하고 `simulformat`으로
+변환한 사본을 `--simulate`에 넘기므로, C++ 쪽 `ParseLine()`은 형식 하나만 알면 됩니다 ([LOGFORMAT.md](LOGFORMAT.md)).
+줄 번호를 유지하려고 주석·빈 줄은 그대로 두고, 맞지 않는 줄은 따옴표를 뺀 원문으로 남겨 squid가 SKIP으로 보고하게 합니다.
 
 `AclSimulator.cci`를 `.h`가 아닌 `.cci`로 둔 이유: `Makefile.am`을 고치지 않기 위해 `main.cc`가 포함하는데,
 `make check`의 testHeaders가 `src/*.h`를 하나씩 `-Werror`로 컴파일하기 때문입니다 (Squid의 `cf_parser.cci`와 같은 관례).
