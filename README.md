@@ -268,6 +268,7 @@ squid 4.10을 root로 실행하면 설정 파싱 단계에서 `cache_log`에 한
 
 ## 문서
 
+- [docs/DESIGN-VERIFICATION.md](docs/DESIGN-VERIFICATION.md): 설계·검증 문서 전체 (구조, 소스 수정 내역, 핵심 메커니즘, 재검토 결과, 한계)
 - [docs/OVERVIEW.md](docs/OVERVIEW.md): 전체 구성도와 흐름도 (squid 내부, 판정, 비교, 최적화, 로그 형식, 매니저, 빌드·검증)
 - [docs/USAGE.md](docs/USAGE.md): 로그 준비, 옵션, 출력 읽는 법, 최적화 항목 전체
 - [docs/LOGFORMAT.md](docs/LOGFORMAT.md): squid-sim.conf, 로그 형식 자동 판별과 변환, 형식별 정확도
