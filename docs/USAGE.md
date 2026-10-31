@@ -3,11 +3,24 @@
 빌드한 `build/squid-<버전>/src/squid` 하나에 옵션으로 붙어 있습니다. `-f`로 준 squid.conf가 "현재" 설정입니다.
 설치(`make install`)는 필요 없고, 실행 중인 squid와 동시에 돌려도 됩니다 (포트를 열지 않음).
 
-대상 로그 형식:
+## 로그 준비
+
+운영 squid.conf에 아래 형식을 정의하고 access.log에 적용합니다. 시뮬레이터는 필드를 **위치로** 읽으므로
+형식 이름(`simulformat`)은 바꿔도 되지만, 필드 순서는 그대로여야 합니다.
 
 ```
-logformat custom %tl %la %>a  "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh
+logformat simulformat %tl %la %>a  "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh
+access_log daemon:/var/log/squid/access.log simulformat
 ```
+
+| 필드 | 뜻 | 시뮬레이터에서의 쓰임 |
+|---|---|---|
+| `%tl` | 프록시 현지 시각 (`31/Oct/2026:09:59:01 +0900`) | `acl time` 평가 시각, 타임존 |
+| `%la` | 프록시의 로컬 IP | `localip`/`myip` |
+| `%>a` | 클라이언트 IP | `src`, `srcdomain` |
+| `%rm %ru HTTP/%rv` | 메서드, URL, HTTP 버전 | `method`, `dstdomain`, `dst`, `port`, `url_regex` 등 |
+| `%>Hs %<st` | 응답 상태, 크기 | 출력에만 사용 |
+| `%Ss:%Sh` | Squid 결과 코드 (`TCP_DENIED` 등) | 시뮬레이션 결과와 비교 (`same`/`DIFF`) |
 
 ## 옵션
 
