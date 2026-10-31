@@ -1,0 +1,708 @@
+#!/usr/bin/env python3
+"""squid-sim: one entry point for the squid simulator and the squid cache manager.
+
+Simulator (runs the patched squid binary built by scripts/build.sh; options pass through):
+  squid-sim -f /etc/squid/squid.conf --simulate access.log [--sim-compare new.conf] [--optimize] [--report out.html]
+
+Cache manager of a running squid (read-only HTTP GETs to /squid-internal-mgr/):
+  squid-sim --manager                         filtered snapshot of the main pages
+  squid-sim -m --page ipcache                 one page, filtered (like curl .../squid-internal-mgr/ipcache)
+  squid-sim -m --page ipcache --raw           one page exactly as squid returns it
+  squid-sim -m --report 60m [--interval 60s]  record for 60 minutes, then write a report
+
+Noise is left out unless --include-local is given: loopback clients, /etc/hosts entries,
+localhost names, and the manager's own requests (also subtracted from request counters).
+Python 3.8+ standard library only.
+"""
+
+import argparse
+import base64
+import datetime
+import glob
+import html
+import ipaddress
+import json
+import os
+import re
+import signal
+import sys
+import time
+import urllib.error
+import urllib.request
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_PAGES = ["info", "counters", "client_list", "ipcache", "fqdncache", "active_requests"]
+# cache manager actions that change squid; this tool only reads
+STATE_CHANGING = {"shutdown", "reconfigure", "rotate", "offline_toggle", "kill", "restart"}
+COUNTER_KEYS = ["client_http.requests", "client_http.hits", "client_http.errors",
+                "client_http.kbytes_in", "client_http.kbytes_out", "server.all.requests",
+                "server.all.errors", "dns.queries"]
+LOCAL_NAMES = re.compile(r"^(localhost|ip6-[a-z]+)(\.|$)", re.I)
+
+
+# ---------------------------------------------------------------- helpers
+
+def parse_duration(text):
+    """60m, 1h, 90s, 1h30m; a bare number means minutes"""
+    text = text.strip().lower()
+    if re.fullmatch(r"\d+(\.\d+)?", text):
+        return float(text) * 60
+    parts = re.findall(r"(\d+(?:\.\d+)?)([hms])", text)
+    if not parts or "".join(n + u for n, u in parts) != text:
+        raise argparse.ArgumentTypeError("expected a duration such as 60m, 1h, 30s or 1h30m: %r" % text)
+    return sum(float(n) * {"h": 3600, "m": 60, "s": 1}[u] for n, u in parts)
+
+
+def fmt_duration(seconds):
+    seconds = int(round(seconds))
+    h, rest = divmod(seconds, 3600)
+    m, s = divmod(rest, 60)
+    return ("%dh" % h if h else "") + ("%dm" % m if m else "") + ("%ds" % s if s or not (h or m) else "")
+
+
+def is_local_addr(text):
+    text = text.strip().strip("[]")
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback or ip.is_unspecified
+
+
+def is_ip_literal(text):
+    try:
+        ipaddress.ip_address(text.strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
+def first_http_port(conf):
+    """manager URL from the first http_port of squid.conf"""
+    try:
+        with open(conf, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = re.match(r"\s*http_port\s+(\S+)", line)
+                if not m:
+                    continue
+                spec = m.group(1)
+                port = spec.rsplit(":", 1)[-1] if ":" in spec else spec
+                if port.isdigit():
+                    host = spec.rsplit(":", 1)[0] if ":" in spec else "127.0.0.1"
+                    if host in ("", "0.0.0.0", "[::]", "*"):
+                        host = "127.0.0.1"
+                    return "http://%s:%s" % (host, port)
+    except OSError:
+        pass
+    return "http://127.0.0.1:3128"
+
+
+# ---------------------------------------------------------------- fetching
+
+class Manager:
+    def __init__(self, base, password=None, timeout=15):
+        self.base = base.rstrip("/")
+        if not self.base.endswith("/squid-internal-mgr"):
+            self.base += "/squid-internal-mgr"
+        self.timeout = timeout
+        self.headers = {"User-Agent": "squid-sim-manager"}
+        if password:
+            token = base64.b64encode(("manager:%s" % password).encode()).decode()
+            self.headers["Authorization"] = "Basic " + token
+        # talk to squid directly, never through a proxy from the environment
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self.requests = 0  # our own successful requests (subtracted from counters)
+        self.kbytes = 0.0
+
+    def get(self, page):
+        req = urllib.request.Request("%s/%s" % (self.base, page), headers=self.headers)
+        with self.opener.open(req, timeout=self.timeout) as resp:
+            body = resp.read()
+        self.requests += 1
+        self.kbytes += len(body) / 1024.0
+        return body.decode("utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------- parsing
+
+def kid_blocks(text):
+    """squid 5+ wraps SMP-aware pages in 'by kidN { ... } by kidN'; returns the bodies"""
+    blocks, current, inside = [], [], False
+    for line in text.splitlines():
+        if re.match(r"^by kid\d+ \{\s*$", line):
+            inside, current = True, []
+            continue
+        if re.match(r"^\} by kid\d+\s*$", line):
+            blocks.append("\n".join(current))
+            inside = False
+            continue
+        if inside:
+            current.append(line)
+    return blocks if blocks else [text]
+
+
+def parse_info(text):
+    info = {}
+    m = re.search(r"Squid Object Cache: Version (\S+)", text)
+    if m:
+        info["version"] = m.group(1)
+    patterns = {
+        "clients": r"Number of clients accessing cache:\s*(\d+)",
+        "http_requests": r"Number of HTTP requests received:\s*(\d+)",
+        "uptime": r"UP Time:\s*([\d.]+)",
+        "cpu_pct": r"CPU Usage:\s*([\d.]+)%",
+        "rss_kb": r"Maximum Resident Size:\s*(\d+)",
+        "fd_in_use": r"Number of file desc currently in use:\s*(\d+)",
+        "fd_max": r"Maximum number of file descriptors:\s*(\d+)",
+        "mem_kb": r"Storage Mem size:\s*(\d+)",
+        "hit_pct_5min": r"Hits as % of all requests:\s*5min:\s*([\d.-]+)%",
+    }
+    for key, pattern in patterns.items():
+        m = re.search(pattern, text)
+        if m:
+            info[key] = float(m.group(1))
+    return info
+
+
+def parse_counters(text):
+    counters = {}
+    for block in kid_blocks(text):
+        for line in block.splitlines():
+            m = re.match(r"^([\w.]+) = ([\d.]+)", line)
+            if m and m.group(1) != "sample_time":
+                counters[m.group(1)] = counters.get(m.group(1), 0) + float(m.group(2))
+    return counters
+
+
+def parse_client_list(text):
+    clients = {}
+    for block in kid_blocks(text):
+        current = None
+        for line in block.splitlines():
+            m = re.match(r"^Address:\s*(\S+)", line)
+            if m:
+                current = clients.setdefault(m.group(1), {"name": "", "http": 0, "codes": {}})
+                continue
+            if current is None:
+                continue
+            if line.startswith("TOTALS"):
+                current = None
+                continue
+            m = re.match(r"^Name:\s*(\S+)", line)
+            if m:
+                current["name"] = m.group(1)
+                continue
+            m = re.match(r"^\s+HTTP\s+Requests\s+(\d+)", line)
+            if m:
+                current["http"] += int(m.group(1))
+                current["section"] = "http"
+                continue
+            m = re.match(r"^\s+ICP\s+Requests\s+(\d+)", line)
+            if m:
+                current["section"] = "icp"
+                continue
+            m = re.match(r"^\s+([A-Z_]+)\s+(\d+)\s+\d+%", line)
+            if m and current.get("section") == "http":
+                current["codes"][m.group(1)] = current["codes"].get(m.group(1), 0) + int(m.group(2))
+    for c in clients.values():
+        c.pop("section", None)
+    return clients
+
+
+def parse_ipcache(text):
+    """hostname -> {flags, ttl, ips:[(ip, ok)]}"""
+    entries = {}
+    for block in kid_blocks(text):
+        in_table, last = False, None
+        for line in block.splitlines():
+            if line.strip().startswith("Hostname") and "Flg" in line:
+                in_table = True
+                continue
+            if not in_table or not line.strip():
+                continue
+            ips = re.findall(r"(\S+)-(OK|BAD)\b", line)
+            m = re.match(r"^ (.{32}) (..)\s+(-?\d+)\s+(-?\d+)\s+(\d+)\(\s*\d+\)", line)
+            if m:
+                name, flags = m.group(1).strip(), m.group(2).strip()
+                last = entries.setdefault(name, {"flags": flags, "ttl": int(m.group(4)), "ips": []})
+                last["flags"] = flags
+                for ip, status in ips:
+                    if (ip, status == "OK") not in last["ips"]:
+                        last["ips"].append((ip, status == "OK"))
+            elif last is not None and ips:  # continuation line with more addresses
+                for ip, status in ips:
+                    if (ip, status == "OK") not in last["ips"]:
+                        last["ips"].append((ip, status == "OK"))
+    return entries
+
+
+def parse_fqdncache(text):
+    """address -> {flags, names}"""
+    entries = {}
+    for block in kid_blocks(text):
+        in_table = False
+        for line in block.splitlines():
+            if line.startswith("Address") and "Hostnames" in line:
+                in_table = True
+                continue
+            if not in_table or not line.strip():
+                continue
+            addr, rest = line[:45].strip(), line[45:]
+            m = re.match(r"^\s*([HN ]{0,2})\s+(-?\d+)\s+(\d+)\s*(.*)$", rest)
+            if not addr or not m:
+                continue
+            entries[addr] = {"flags": m.group(1).strip(), "names": m.group(4).split()}
+    return entries
+
+
+def parse_active(text):
+    reqs = []
+    for block in kid_blocks(text):
+        remote = None
+        req = None
+        for line in block.splitlines():
+            s = line.strip()
+            m = re.match(r"^remote:\s*(\S+)", s)
+            if m:
+                remote = m.group(1).rsplit(":", 1)[0].strip("[]")
+                continue
+            if s.startswith("uri "):
+                req = {"client": remote or "", "uri": s[4:].strip(), "logtype": "", "age": 0.0, "user": "-"}
+                reqs.append(req)
+                continue
+            if req is None:
+                continue
+            if s.startswith("logType "):
+                req["logtype"] = s.split(None, 1)[1]
+            m = re.match(r"^start\s+[\d.]+\s+\(([\d.]+) seconds ago\)", s)
+            if m:
+                req["age"] = float(m.group(1))
+            if s.startswith("username "):
+                req["user"] = s.split(None, 1)[1]
+    return reqs
+
+
+# ---------------------------------------------------------------- filtering
+
+def filter_snapshot(snap, include_local):
+    """drops noise; returns the filtered copy"""
+    out = dict(snap)
+    if include_local:
+        return out
+    out["clients"] = {a: c for a, c in snap.get("clients", {}).items() if not is_local_addr(a)}
+    out["ipcache"] = {h: e for h, e in snap.get("ipcache", {}).items()
+                      if "H" not in e["flags"] and not LOCAL_NAMES.match(h) and not is_ip_literal(h)}
+    out["fqdncache"] = {a: e for a, e in snap.get("fqdncache", {}).items()
+                        if "H" not in e["flags"] and not is_local_addr(a)}
+    out["active"] = [r for r in snap.get("active", [])
+                     if "/squid-internal-mgr/" not in r["uri"] and not r["uri"].startswith("cache_object:")
+                     and not is_local_addr(r["client"])]
+    return out
+
+
+def take_snapshot(mgr, pages, errors):
+    snap = {"time": time.time(), "own_requests_before": mgr.requests, "own_kbytes_before": mgr.kbytes}
+    parsers = {"info": ("info", parse_info), "counters": ("counters", parse_counters),
+               "client_list": ("clients", parse_client_list), "ipcache": ("ipcache", parse_ipcache),
+               "fqdncache": ("fqdncache", parse_fqdncache), "active_requests": ("active", parse_active)}
+    for page in pages:
+        try:
+            text = mgr.get(page)
+        except (urllib.error.URLError, OSError) as e:
+            errors.append("%s %s: %s" % (time.strftime("%H:%M:%S"), page, e))
+            continue
+        if page in parsers:
+            key, parser = parsers[page]
+            snap[key] = parser(text)
+    return snap
+
+
+# ---------------------------------------------------------------- one-shot output
+
+def print_snapshot(snap, base):
+    info = snap.get("info", {})
+    print("# squid %s at %s, up %s" % (info.get("version", "?"), base, fmt_duration(info.get("uptime", 0))))
+    if "clients" in snap:
+        print("\n## clients (loopback excluded)")
+        rows = sorted(snap["clients"].items(), key=lambda kv: -kv[1]["http"])
+        for addr, c in rows:
+            codes = ", ".join("%s %d" % kv for kv in sorted(c["codes"].items(), key=lambda kv: -kv[1])[:4])
+            print("  %-40s %8d  %s" % (addr, c["http"], codes))
+        if not rows:
+            print("  (none)")
+    if "ipcache" in snap:
+        print("\n## DNS cache: forward lookups (hosts-file and localhost entries excluded)")
+        for host, e in sorted(snap["ipcache"].items()):
+            ips = " ".join(ip + ("" if ok else "(bad)") for ip, ok in e["ips"]) or "-"
+            neg = "  NEGATIVE (lookup failed)" if "N" in e["flags"] else ""
+            print("  %-45s ttl %6d  %s%s" % (host, e["ttl"], ips, neg))
+        if not snap["ipcache"]:
+            print("  (none)")
+    if "fqdncache" in snap:
+        print("\n## DNS cache: reverse lookups")
+        for addr, e in sorted(snap["fqdncache"].items()):
+            print("  %-45s %s%s" % (addr, " ".join(e["names"]) or "-", "  NEGATIVE" if "N" in e["flags"] else ""))
+        if not snap["fqdncache"]:
+            print("  (none)")
+    if "active" in snap:
+        print("\n## active requests (manager requests excluded)")
+        for r in sorted(snap["active"], key=lambda r: -r["age"]):
+            print("  %8.1fs  %-40s %s  %s" % (r["age"], r["client"], r["logtype"], r["uri"]))
+        if not snap["active"]:
+            print("  (none)")
+    if "counters" in snap:
+        print("\n## counters since squid started (manager requests included)")
+        for key in COUNTER_KEYS:
+            if key in snap["counters"]:
+                print("  %-28s %d" % (key, snap["counters"][key]))
+
+
+# ---------------------------------------------------------------- recording and report
+
+def record(mgr, pages, duration, interval, out_dir, include_local):
+    os.makedirs(out_dir, exist_ok=True)
+    stop = {"now": False}
+
+    def on_signal(signum, frame):
+        stop["now"] = True
+        print("\nstopping early; writing the report with what was recorded", file=sys.stderr)
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    errors, snaps = [], []
+    start = time.time()
+    end = start + duration
+    path = os.path.join(out_dir, "snapshots.jsonl")
+    with open(path, "a", encoding="utf-8") as jsonl:
+        while True:
+            snap = filter_snapshot(take_snapshot(mgr, pages, errors), include_local)
+            snaps.append(snap)
+            jsonl.write(json.dumps(snap) + "\n")
+            jsonl.flush()
+            done = len(snaps)
+            print("[%s] poll %d: %d clients, %d DNS names, %d active%s" % (
+                time.strftime("%H:%M:%S"), done, len(snap.get("clients", {})), len(snap.get("ipcache", {})),
+                len(snap.get("active", [])), "  (%d errors so far)" % len(errors) if errors else ""), file=sys.stderr)
+            if stop["now"] or time.time() >= end:
+                break
+            wake = min(end, snaps[-1]["time"] + interval)
+            while not stop["now"] and time.time() < wake:
+                time.sleep(min(1.0, wake - time.time()))
+            if stop["now"]:
+                break
+    return snaps, errors, start
+
+
+def summarize(snaps):
+    first, last = snaps[0], snaps[-1]
+    s = {"start": first["time"], "end": last["time"], "polls": len(snaps),
+         "version": last.get("info", {}).get("version") or first.get("info", {}).get("version", "?")}
+
+    # traffic per interval from counters, minus our own manager requests
+    series = []
+    for a, b in zip(snaps, snaps[1:]):
+        if "counters" not in a or "counters" not in b:
+            continue
+        minutes = max((b["time"] - a["time"]) / 60.0, 1e-9)
+        own = b["own_requests_before"] - a["own_requests_before"]
+        own_kb = b["own_kbytes_before"] - a["own_kbytes_before"]
+        d = {k: b["counters"].get(k, 0) - a["counters"].get(k, 0) for k in COUNTER_KEYS}
+        if d["client_http.requests"] < 0:  # squid restarted
+            continue
+        req = max(d["client_http.requests"] - own, 0)
+        series.append({"t": b["time"], "minutes": minutes, "requests": req,
+                       "per_min": req / minutes, "errors": d["client_http.errors"],
+                       "hits": d["client_http.hits"], "kb_out": max(d["client_http.kbytes_out"] - own_kb, 0),
+                       "server": d["server.all.requests"]})
+    s["series"] = series
+    s["requests"] = sum(x["requests"] for x in series)
+    s["errors"] = sum(x["errors"] for x in series)
+    s["hits"] = sum(x["hits"] for x in series)
+    s["kb_out"] = sum(x["kb_out"] for x in series)
+    s["peak_per_min"] = max([x["per_min"] for x in series] or [0])
+    minutes = (s["end"] - s["start"]) / 60.0
+    s["avg_per_min"] = s["requests"] / minutes if minutes > 0 else 0
+
+    # clients: requests during the window (an address absent at first counts from zero)
+    start_counts = {a: c for a, c in first.get("clients", {}).items()}
+    clients = {}
+    for snap in snaps:
+        for addr, c in snap.get("clients", {}).items():
+            base = start_counts.get(addr, {"http": 0, "codes": {}})
+            row = clients.setdefault(addr, {"name": c["name"], "first": snap["time"]})
+            row["requests"] = max(c["http"] - base["http"], 0)
+            row["codes"] = {k: max(v - base["codes"].get(k, 0), 0) for k, v in c["codes"].items()}
+            row["last"] = snap["time"]
+    s["clients"] = sorted(([a, r] for a, r in clients.items() if r["requests"] > 0),
+                          key=lambda ar: -ar[1]["requests"])
+
+    # DNS: names seen in the cache during the window
+    dns = {}
+    for snap in snaps:
+        for host, e in snap.get("ipcache", {}).items():
+            row = dns.setdefault(host, {"first": snap["time"], "ips": set(), "negative": False, "polls": 0})
+            row["last"] = snap["time"]
+            row["polls"] += 1
+            row["ips"].update(ip for ip, ok in e["ips"])
+            row["negative"] = row["negative"] or "N" in e["flags"]
+    initial = set(first.get("ipcache", {}))
+    s["dns"] = sorted(([h, dict(r, ips=sorted(r["ips"]), new=h not in initial)] for h, r in dns.items()),
+                      key=lambda hr: (hr[1]["negative"], -hr[1]["polls"], hr[0]))
+    rdns = {}
+    for snap in snaps:
+        for addr, e in snap.get("fqdncache", {}).items():
+            rdns[addr] = {"names": e["names"], "negative": "N" in e["flags"]}
+    s["rdns"] = sorted(rdns.items())
+
+    # active requests: the longest seen per client + URL
+    active = {}
+    for snap in snaps:
+        for r in snap.get("active", []):
+            key = (r["client"], r["uri"])
+            row = active.setdefault(key, {"client": r["client"], "uri": r["uri"], "max_age": 0, "seen": 0,
+                                          "logtype": r["logtype"], "user": r["user"]})
+            row["max_age"] = max(row["max_age"], r["age"])
+            row["seen"] += 1
+    s["active"] = sorted(active.values(), key=lambda r: -r["max_age"])
+
+    # resources
+    res = {}
+    for key in ("rss_kb", "fd_in_use", "mem_kb", "cpu_pct"):
+        values = [snap["info"][key] for snap in snaps if key in snap.get("info", {})]
+        if values:
+            res[key] = (min(values), max(values), values[-1])
+    s["resources"] = res
+    return s
+
+
+def write_text(s, errors, base, path):
+    lines = []
+    w = lines.append
+    t0 = datetime.datetime.fromtimestamp(s["start"]).strftime("%Y-%m-%d %H:%M:%S")
+    t1 = datetime.datetime.fromtimestamp(s["end"]).strftime("%Y-%m-%d %H:%M:%S")
+    w("squid cache manager report: squid %s at %s" % (s["version"], base))
+    w("window: %s - %s (%s), %d polls, %d errors" % (t0, t1, fmt_duration(s["end"] - s["start"]), s["polls"], len(errors)))
+    w("excluded: loopback clients, /etc/hosts and localhost DNS entries, manager requests")
+    w("")
+    w("requests %d  (avg %.1f/min, peak %.1f/min)  errors %d  hits %d  sent %.0f KB" % (
+        s["requests"], s["avg_per_min"], s["peak_per_min"], s["errors"], s["hits"], s["kb_out"]))
+    w("")
+    w("top clients:")
+    for addr, r in s["clients"][:20]:
+        codes = ", ".join("%s %d" % kv for kv in sorted(r["codes"].items(), key=lambda kv: -kv[1]) if kv[1])
+        w("  %-40s %8d  %s" % (addr, r["requests"], codes))
+    if not s["clients"]:
+        w("  (no client other than localhost sent requests)")
+    w("")
+    w("DNS names resolved (new = not cached when recording started):")
+    for host, r in s["dns"][:200]:
+        w("  %-45s %s%s%s" % (host, " ".join(r["ips"]) or "-", "  NEW" if r["new"] else "",
+                              "  FAILED" if r["negative"] else ""))
+    if not s["dns"]:
+        w("  (none)")
+    w("")
+    w("longest active requests:")
+    for r in s["active"][:20]:
+        w("  %8.1fs  %-40s %s" % (r["max_age"], r["client"], r["uri"]))
+    if not s["active"]:
+        w("  (none in flight at poll times)")
+    if errors:
+        w("")
+        w("errors:")
+        for e in errors[:50]:
+            w("  " + e)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def write_html(s, errors, base, path):
+    e = html.escape
+    t0 = datetime.datetime.fromtimestamp(s["start"]).strftime("%Y-%m-%d %H:%M:%S")
+    t1 = datetime.datetime.fromtimestamp(s["end"]).strftime("%Y-%m-%d %H:%M:%S")
+
+    def card(label, value, cls=""):
+        return '<div class="card %s"><div class="label">%s</div><div class="value">%s</div></div>' % (cls, e(label), e(value))
+
+    # requests per interval as an inline SVG bar chart
+    series = s["series"]
+    chart = '<p class="muted">Not enough polls for a traffic chart.</p>'
+    if series:
+        w, h, pad = 880, 180, 36
+        top = max(max(x["per_min"] for x in series), 1)
+        bw = (w - pad - 8) / len(series)
+        bars, labels = [], []
+        for i, x in enumerate(series):
+            bh = (h - 40) * x["per_min"] / top
+            bx = pad + i * bw
+            bars.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="2"><title>%s: %.1f req/min</title></rect>' % (
+                bx + 1, h - 22 - bh, max(bw - 2, 1), bh,
+                datetime.datetime.fromtimestamp(x["t"]).strftime("%H:%M:%S"), x["per_min"]))
+        for i in (0, len(series) // 2, len(series) - 1):
+            x = series[i]
+            labels.append('<text x="%.1f" y="%d" class="axis">%s</text>' % (
+                pad + i * bw + 2, h - 6, datetime.datetime.fromtimestamp(x["t"]).strftime("%H:%M")))
+        chart = ('<svg viewBox="0 0 %d %d" class="chart" role="img" aria-label="requests per minute">'
+                 '<text x="0" y="14" class="axis">%.0f/min</text><line x1="%d" x2="%d" y1="%d" y2="%d" class="base"/>'
+                 '%s%s</svg>') % (w, h, top, pad, w, h - 22, h - 22, "".join(bars), "".join(labels))
+
+    client_rows = "".join(
+        "<tr><td class='mono'>%s</td><td>%s</td><td class='num'>%d</td><td class='mono small'>%s</td></tr>" % (
+            e(a), e(r["name"] if r["name"] != a else ""), r["requests"],
+            e(", ".join("%s %d" % kv for kv in sorted(r["codes"].items(), key=lambda kv: -kv[1]) if kv[1])))
+        for a, r in s["clients"][:100]) or "<tr><td colspan=4 class='muted'>No client other than localhost sent requests.</td></tr>"
+    dns_rows = "".join(
+        "<tr><td class='mono'>%s</td><td class='mono small'>%s</td><td>%s</td><td class='num'>%d</td></tr>" % (
+            e(hn), e(" ".join(r["ips"]) or "-"),
+            ("<span class='pill bad'>failed</span> " if r["negative"] else "") + ("<span class='pill new'>new</span>" if r["new"] else ""),
+            r["polls"])
+        for hn, r in s["dns"][:500]) or "<tr><td colspan=4 class='muted'>No DNS names besides /etc/hosts and localhost.</td></tr>"
+    rdns_rows = "".join(
+        "<tr><td class='mono'>%s</td><td class='mono'>%s</td></tr>" % (e(a), e(" ".join(r["names"]) or ("(failed)" if r["negative"] else "-")))
+        for a, r in s["rdns"][:300]) or "<tr><td colspan=2 class='muted'>None.</td></tr>"
+    active_rows = "".join(
+        "<tr><td class='num'>%.1f s</td><td class='mono'>%s</td><td class='mono small'>%s</td><td>%s</td></tr>" % (
+            r["max_age"], e(r["client"]), e(r["uri"]), e(r["logtype"]))
+        for r in s["active"][:100]) or "<tr><td colspan=4 class='muted'>No request was in flight at poll times.</td></tr>"
+    res_names = {"rss_kb": "max resident size (KB)", "fd_in_use": "file descriptors in use",
+                 "mem_kb": "storage memory (KB)", "cpu_pct": "CPU usage (%)"}
+    res_rows = "".join("<tr><td>%s</td><td class='num'>%g</td><td class='num'>%g</td><td class='num'>%g</td></tr>" % (
+        e(res_names[k]), v[0], v[1], v[2]) for k, v in s["resources"].items())
+    err_html = ("<h2>Errors</h2><ul>%s</ul>" % "".join("<li class='mono small'>%s</li>" % e(x) for x in errors[:100])) if errors else ""
+
+    doc = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Squid Manager Report</title><style>
+:root{--bg:#f7f7f5;--panel:#fff;--text:#1d1d1b;--muted:#6b6b66;--line:#e3e2dc;--accent:#3b5bdb;--bad:#c0362c;--bad-bg:#fbe6e3;--new:#1a7f4b;--new-bg:#e3f4ea}
+@media (prefers-color-scheme:dark){:root{--bg:#161615;--panel:#1f1f1d;--text:#ecebe6;--muted:#9c9b95;--line:#33332f;--accent:#8ea2ff;--bad:#ff7b6e;--bad-bg:#3a1a17;--new:#5fd08f;--new-bg:#163322}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,'Segoe UI','Noto Sans KR',sans-serif}
+main{max-width:1100px;margin:0 auto;padding:24px 16px 64px}h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:28px 0 10px}
+.muted{color:var(--muted)}.mono{font-family:ui-monospace,Menlo,Consolas,monospace}.small{font-size:12px}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}.card .label{font-size:12px;color:var(--muted)}.card .value{font-size:22px;font-weight:650}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:4px 0;overflow-x:auto}
+table{border-collapse:collapse;width:100%}th,td{padding:7px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{font-size:12px;color:var(--muted)}tbody tr:last-child td{border-bottom:0}.num{text-align:right;font-variant-numeric:tabular-nums}
+.pill{display:inline-block;padding:0 7px;border-radius:999px;font-size:11px;font-weight:700}.pill.bad{background:var(--bad-bg);color:var(--bad)}.pill.new{background:var(--new-bg);color:var(--new)}
+.chart{width:100%;height:auto}.chart rect{fill:var(--accent)}.chart .axis{fill:var(--muted);font-size:11px}.chart .base{stroke:var(--line)}
+</style></head><body><main>"""
+    doc += "<h1>Squid cache manager report</h1>"
+    doc += "<div class='muted'>squid %s at <span class='mono'>%s</span> &middot; %s &ndash; %s (%s) &middot; %d polls</div>" % (
+        e(s["version"]), e(base), t0, t1, fmt_duration(s["end"] - s["start"]), s["polls"])
+    doc += "<p class='muted small'>Excluded: loopback clients, /etc/hosts and localhost DNS entries, and the manager's own requests (also subtracted from request counts).</p>"
+    doc += "<div class='cards'>%s%s%s%s%s%s%s</div>" % (
+        card("requests", "%d" % s["requests"]), card("avg / min", "%.1f" % s["avg_per_min"]),
+        card("peak / min", "%.1f" % s["peak_per_min"]), card("errors", "%d" % s["errors"]),
+        card("clients", "%d" % len(s["clients"])), card("DNS names", "%d" % len(s["dns"])),
+        card("DNS failures", "%d" % sum(1 for _, r in s["dns"] if r["negative"])))
+    doc += "<h2>Requests per minute</h2><div class='panel' style='padding:12px'>%s</div>" % chart
+    doc += "<h2>Clients</h2><div class='panel'><table><thead><tr><th>address</th><th>name</th><th class='num'>requests</th><th>result codes</th></tr></thead><tbody>%s</tbody></table></div>" % client_rows
+    doc += "<h2>DNS names resolved</h2><p class='muted small'>new = not in the cache when recording started; failed = negative-cached lookup.</p><div class='panel'><table><thead><tr><th>hostname</th><th>addresses</th><th></th><th class='num'>polls seen</th></tr></thead><tbody>%s</tbody></table></div>" % dns_rows
+    doc += "<h2>Reverse DNS</h2><div class='panel'><table><thead><tr><th>address</th><th>names</th></tr></thead><tbody>%s</tbody></table></div>" % rdns_rows
+    doc += "<h2>Longest active requests</h2><div class='panel'><table><thead><tr><th class='num'>age</th><th>client</th><th>URL</th><th>log type</th></tr></thead><tbody>%s</tbody></table></div>" % active_rows
+    if res_rows:
+        doc += "<h2>Resources</h2><div class='panel'><table><thead><tr><th></th><th class='num'>min</th><th class='num'>max</th><th class='num'>last</th></tr></thead><tbody>%s</tbody></table></div>" % res_rows
+    doc += err_html + "</main></body></html>\n"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(doc)
+
+
+# ---------------------------------------------------------------- simulator pass-through
+
+def find_binary(explicit):
+    if explicit:
+        return explicit
+    if os.environ.get("SQUID_SIM_BINARY"):
+        return os.environ["SQUID_SIM_BINARY"]
+    found = sorted(glob.glob(os.path.join(ROOT, "build", "squid-*", "src", "squid")))
+    return found[-1] if found else None
+
+
+def run_simulator(argv):
+    binary = None
+    if argv[:1] == ["--binary"] and len(argv) >= 2:
+        binary, argv = argv[1], argv[2:]
+    binary = find_binary(binary)
+    if not binary or not os.access(binary, os.X_OK):
+        sys.exit("squid-sim: patched squid not found; run scripts/build.sh or pass --binary PATH")
+    os.execv(binary, [binary] + argv)
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    argv = sys.argv[1:]
+    if not any(a in ("--manager", "-m") for a in argv):
+        if not argv or argv[0] in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        run_simulator(argv)
+
+    p = argparse.ArgumentParser(prog="squid-sim --manager",
+                                description="Query or record the cache manager of a running squid (read-only).")
+    p.add_argument("--manager", "-m", action="store_true", help="cache manager mode")
+    p.add_argument("--url", help="squid address, e.g. http://127.0.0.1:8090 (default: first http_port of --conf)")
+    p.add_argument("--conf", default="/etc/squid/squid.conf", help="squid.conf used to guess --url")
+    p.add_argument("--page", action="append", help="page(s) to show, e.g. ipcache (repeat or comma-separate)")
+    p.add_argument("--raw", action="store_true", help="print pages exactly as squid returns them")
+    p.add_argument("--report", type=parse_duration, metavar="DURATION",
+                   help="record for DURATION (60m, 1h, 30s; a bare number means minutes) and write a report")
+    p.add_argument("--interval", type=parse_duration, default=60.0, metavar="DURATION",
+                   help="time between polls while recording (default 60s)")
+    p.add_argument("--out", help="report directory (default ./manager-report-YYYYmmdd-HHMMSS)")
+    p.add_argument("--include-local", action="store_true", help="keep localhost/hosts-file entries and manager requests")
+    p.add_argument("--password-env", metavar="VAR", help="environment variable holding the cachemgr_passwd password")
+    p.add_argument("--timeout", type=float, default=15.0, help="seconds per request (default 15)")
+    args = p.parse_args(argv)
+    if args.interval < 1:
+        p.error("--interval must be at least 1s")
+
+    base = args.url or first_http_port(args.conf)
+    password = os.environ.get(args.password_env) if args.password_env else None
+    mgr = Manager(base, password, args.timeout)
+    pages = []
+    for item in args.page or []:
+        pages += [x for x in item.split(",") if x]
+    pages = pages or list(DEFAULT_PAGES)
+    refused = [x for x in pages if x.split("?")[0].lower() in STATE_CHANGING]
+    if refused:
+        p.error("refusing %s: squid-sim only reads; use squid -k or squidclient for actions that change squid"
+                % ", ".join(refused))
+
+    if args.report is None:
+        if args.raw:
+            for page in pages:
+                try:
+                    sys.stdout.write(mgr.get(page))
+                except (urllib.error.URLError, OSError) as e:
+                    sys.exit("squid-sim: %s/%s: %s" % (mgr.base, page, e))
+            return 0
+        errors = []
+        snap = filter_snapshot(take_snapshot(mgr, pages, errors), args.include_local)
+        print_snapshot(snap, mgr.base)
+        for err in errors:
+            print("error: " + err, file=sys.stderr)
+        return 1 if errors and len(errors) == len(pages) else 0
+
+    for page in ("counters", "info"):
+        if page not in pages:
+            pages.insert(0, page)
+    pages.remove("counters")
+    pages.insert(0, "counters")  # first, so the subtraction of our own requests lines up
+    out_dir = args.out or "manager-report-" + time.strftime("%Y%m%d-%H%M%S")
+    print("recording %s every %s from %s into %s (Ctrl-C stops early)" % (
+        fmt_duration(args.report), fmt_duration(args.interval), mgr.base, out_dir), file=sys.stderr)
+    snaps, errors, _ = record(mgr, pages, args.report, args.interval, out_dir, args.include_local)
+    if len(snaps) < 1 or all("counters" not in s for s in snaps):
+        print("no successful poll; is squid running at %s and does http_access allow manager from here?" % mgr.base,
+              file=sys.stderr)
+        return 1
+    s = summarize(snaps)
+    write_text(s, errors, mgr.base, os.path.join(out_dir, "summary.txt"))
+    write_html(s, errors, mgr.base, os.path.join(out_dir, "report.html"))
+    print("wrote %s/report.html, %s/summary.txt, %s/snapshots.jsonl" % (out_dir, out_dir, out_dir), file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

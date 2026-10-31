@@ -10,6 +10,10 @@ Squid 소스에 패치로 붙어서, 판정은 Squid 자신의 설정 파서와 
 | 설정 비교 | `--sim-compare new.conf` | 새 squid.conf로 바꾸면 판정이나 판정 규칙이 달라지는 요청 |
 | 최적화 | `--optimize` | 쓰이지 않는 ACL, 이미 포함된 값, 도달할 수 없거나 중복된 규칙, 내장 ACL 재정의 |
 | 리포트 | `--report out.html` | 위 결과 전체를 담은 HTML 한 파일 (검색·필터, 규칙별 평가 과정) |
+| 캐시 매니저 | `squid-sim -m [--report 60m]` | 실행 중인 squid의 클라이언트, DNS 조회·실패, 진행 중 요청, 분당 요청을 localhost 같은 잡음 없이 조회하거나 기록 |
+
+모든 기능은 `scripts/squid-sim` 하나로 실행합니다. `-m`이 없으면 인자를 패치한 squid로 그대로 넘기고, `-m`이 있으면
+실행 중인 squid의 캐시 매니저(`/squid-internal-mgr/`)를 읽습니다.
 
 ## 브랜치
 
@@ -43,15 +47,37 @@ scripts/build.sh --deps        # 빌드 패키지 설치(sudo) → 공식 소스
 패치된 바이너리는 `build/squid-4.10/src/squid`입니다. `make install`은 하지 않으며, 시스템의 squid는 건드리지 않습니다.
 설치된 squid와 비교까지 한 번에 검증하려면 `scripts/verify-target.sh`를 실행합니다.
 
-### 3. 실행
+### 3. 시뮬레이션
 
 ```bash
-B=build/squid-4.10/src/squid
-$B -f /etc/squid/squid.conf --simulate /var/log/squid/access.log            # 요청별 판정
-$B -f /etc/squid/squid.conf --simulate access.log --sim-compare new.conf    # 설정 비교
-$B -f /etc/squid/squid.conf --optimize                                      # 최적화 항목
-$B -f /etc/squid/squid.conf --simulate access.log --sim-compare new.conf \
+S=scripts/squid-sim          # build/squid-4.10/src/squid를 찾아 실행
+$S -f /etc/squid/squid.conf --simulate /var/log/squid/access.log            # 요청별 판정
+$S -f /etc/squid/squid.conf --simulate access.log --sim-compare new.conf    # 설정 비교
+$S -f /etc/squid/squid.conf --optimize                                      # 최적화 항목
+$S -f /etc/squid/squid.conf --simulate access.log --sim-compare new.conf \
    --optimize --report report.html                                          # 전체 리포트
+```
+
+### 4. 실행 중인 squid 살펴보기 (캐시 매니저)
+
+```bash
+$S -m                                   # 클라이언트, DNS, 진행 중 요청, 카운터 요약
+$S -m --page ipcache                    # curl http://127.0.0.1:8090/squid-internal-mgr/ipcache 대신
+$S -m --url http://127.0.0.1:8090 --report 60m     # 60분 동안 60초마다 기록 → report.html, summary.txt
+```
+
+localhost 클라이언트, `/etc/hosts` 고정 항목, 매니저 조회 자신은 빼고 보여주며, 요청 수에서도 조회 횟수를 뺍니다.
+상태를 바꾸는 매니저 동작(`shutdown`, `reconfigure` 등)은 거부합니다. 자세한 내용은 [docs/MANAGER.md](docs/MANAGER.md)에 있습니다.
+
+```text
+requests 72  (avg 24.0/min, peak 42.0/min)  errors 43  hits 11  sent 1447 KB
+
+top clients:
+  192.168.50.25                                  32  TCP_DENIED 32
+
+DNS names resolved (new = not cached when recording started):
+  example.com                                   104.20.23.154 172.66.147.243 …  NEW
+  no-such-host-1.invalid                        -  NEW  FAILED
 ```
 
 ## 출력 예시
@@ -188,10 +214,29 @@ Squid는 첫 매칭에서 멈추므로, 뒤에서 허용했을 규칙을 알려�
 | `src/acl/Tree.cc` | `bannedAction()`의 위치 조건 | 꺼져 있음 |
 | `src/acl/{Acl,InnerNode,DomainData,Ip,RegexData}.cc` | Squid가 이미 내던 중복·포함 경고와 ACL 참조를 기록 (`--optimize`용) | 기록 안 함 |
 | `src/ipcache.cc`, `src/fqdncache.cc` | DNS 캐시 미스 시 조회 생략 또는 동기 조회 | 기존 비동기 조회 |
-| `src/cache_cf.cc`, `src/globals.h` | 설정이 가리키는 파일(예: `mime.conf`)이 없어도 `-k parse`처럼 계속 진행 | 기존 동작 |
+| `src/cache_cf.cc`, `src/globals.h` | 설정이 가리키는 파일(예: `mime.conf`)이 없어도 `-k parse`처럼 계속 진행, 시뮬레이터 모드에서는 `cache_log`를 열지 않음 | 기존 동작 |
 | `src/external_acl.cc` | helper가 없을 때의 NULL 역참조 방지 | 운영 중엔 해당 없음 |
 
 자세한 설명은 [docs/DESIGN.md](docs/DESIGN.md)에 있습니다.
+
+## 운영 중인 squid에 주는 영향
+
+**시뮬레이터는 실행 중인 squid에 영향을 주지 않습니다.** 두 테스트 서버(squid 4.10, 7.7)에서 실제 `/etc/squid/squid.conf`로
+`--simulate`·`--optimize`를 일반 사용자와 root로 각각 실행하며 `strace`로 시스템 호출을 추적했습니다.
+
+| 확인 항목 | 결과 |
+|---|---|
+| 실행 중인 squid 프로세스 | PID, 시작 시각, 재시작 횟수 모두 그대로 |
+| 시그널 전송 (`kill`) | 0 — `-k` 계열 동작을 하지 않음 |
+| 네트워크 | TCP/UDP 연결·listen 없음. IPv6 지원 확인용 `[::1]:0` 소켓 하나, 인터페이스 목록 조회, 사용자 정보 조회(nscd, systemd userdb)뿐 |
+| 쓰기로 연 파일 | 0 (root로 실행해도). PID 파일, cache.log, access.log, 캐시 디렉터리 모두 손대지 않음 |
+| 공유 메모리, 자식 프로세스 | 0 |
+
+설정 파싱까지만 squid와 같이 하고, PID 파일 작성·포트 열기·캐시 초기화 전에 갈라지기 때문입니다. 검증 중
+squid 4.10을 root로 실행하면 설정 파싱 단계에서 `cache_log`에 한 줄을 쓰는 것을 발견해, 시뮬레이터 모드에서는 열지 않도록
+고쳤습니다(7.7은 원래 그 단계에서 열지 않음). `scripts/verify-target.sh`가 매번 이 무영향 여부를 다시 확인합니다.
+
+캐시 매니저 모드(`-m`)는 squid에 읽기 전용 GET을 보냅니다. 이 요청은 127.0.0.1의 요청으로 access.log에 남습니다.
 
 ## 정확도와 한계
 
@@ -211,6 +256,7 @@ Squid는 첫 매칭에서 멈추므로, 뒤에서 허용했을 규칙을 알려�
 ## 문서
 
 - [docs/USAGE.md](docs/USAGE.md): 로그 준비, 옵션, 출력 읽는 법, 최적화 항목 전체
+- [docs/MANAGER.md](docs/MANAGER.md): 캐시 매니저 조회·기록, 제외 규칙, 리포트 읽는 법
 - [docs/DESIGN.md](docs/DESIGN.md): 구조, 핵심 메커니즘, 소스 수정 내역
 - [docs/VERIFICATION.md](docs/VERIFICATION.md): 검증 환경·결과, 검증 중 고친 결함, 한계
 
@@ -218,10 +264,12 @@ Squid는 첫 매칭에서 멈추므로, 뒤에서 허용했을 규칙을 알려�
 
 ```
 patches/squid-4.10-acl-simulator.patch   Squid 소스에 적용하는 패치 (patch -p1)
+scripts/squid-sim                        모든 기능의 실행 진입점 (시뮬레이터 실행, 캐시 매니저 조회·기록)
 scripts/target.env                       이 브랜치의 대상 OS, squid 버전, 체크섬, configure 옵션
 scripts/build.sh                         다운로드 → SHA-256 확인 → 패치 → configure → make [--check]
 scripts/test.sh                          tests/의 설정·로그로 기능 테스트
-scripts/verify-target.sh                 대상 OS에서 전체 검증 (빌드 + make check + 기능 테스트 + 배포판 비교)
+scripts/verify-target.sh                 대상 OS에서 전체 검증 (빌드 + make check + 기능 테스트 + 배포판 비교
+                                         + 실행 중인 squid 무영향 + 캐시 매니저)
 tests/                                   테스트용 squid.conf, 비교용 conf, access.log, 기대 결과
 docs/                                    문서
 ```

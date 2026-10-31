@@ -1592,7 +1592,19 @@
 +
 --- a/src/cache_cf.cc
 +++ b/src/cache_cf.cc
-@@ -3918,8 +3918,9 @@
+@@ -592,7 +592,10 @@
+     if (!Config.chroot_dir) {
+         leave_suid();
+         setUmask(Config.umask);
+-        _db_init(Debug::cache_log, Debug::debugOptions);
++        // squid --simulate/--optimize keeps logging to stderr: never append to
++        // the cache_log of a squid that may be running with this configuration
++        if (!opt_simulate)
++            _db_init(Debug::cache_log, Debug::debugOptions);
+         enter_suid();
+     }
+ 
+@@ -3918,8 +3921,9 @@
      if (stat(path, &sb) < 0) {
          int xerrno = errno;
          debugs(0, DBG_CRITICAL, (opt_parse_cfg_only?"FATAL: ":"ERROR: ") << name << " " << path << ": " << xstrerr(xerrno));
