@@ -107,6 +107,10 @@ Squid는 첫 매칭에서 멈추므로, 뒤에서 허용했을 규칙을 알려�
 | `src/external_acl.cc` | +4 | helper 미초기화 시 DUNNO (NULL 역참조 방지) | 없음 (운영 중엔 항상 초기화) |
 | `src/ipcache.h`, `.cc` | +5, +63 | `ipcache_simulator_mode` 0/1/2 | 없음 (기본 0) |
 | `src/fqdncache.h`, `.cc` | +3, +40 | `fqdncache_simulator_mode` | 없음 (기본 0) |
+| `src/globals.h`, `src/cache_cf.cc` | +1, +3 / −2 | `opt_simulate`: 설정이 가리키는 파일(`mime.conf` 등)이 없어도 경고만 함 (squid 7.7은 `cache_log`를 시뮬레이터 분기 뒤에 열어 따로 막을 필요 없음) | 없음 (기본 0) |
+
+시뮬레이터 바깥의 `scripts/squid-sim`은 Python 스크립트로, 패치한 squid를 실행하는 진입점이자 실행 중인 squid의 캐시 매니저
+(`/squid-internal-mgr/`)를 읽는 도구입니다. 캐시 매니저 쪽은 Squid 소스를 고치지 않고 HTTP GET만 씁니다 ([MANAGER.md](MANAGER.md)).
 
 `AclSimulator.cci`를 `.h`가 아닌 `.cci`로 둔 이유: `Makefile.am`을 고치지 않기 위해 `main.cc`가 포함하는데,
 `make check`의 testHeaders가 `src/*.h`를 하나씩 `-Werror`로 컴파일하기 때문입니다 (Squid의 `cf_parser.cci`와 같은 관례).

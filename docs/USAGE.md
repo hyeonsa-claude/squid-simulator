@@ -1,6 +1,8 @@
 # 사용법
 
-빌드한 `build/squid-<버전>/src/squid` 하나에 옵션으로 붙어 있습니다. `-f`로 준 squid.conf가 "현재" 설정입니다.
+빌드한 `build/squid-<버전>/src/squid` 하나에 옵션으로 붙어 있습니다. `scripts/squid-sim`으로 실행하면 이 바이너리를 찾아
+인자를 그대로 넘기므로, 아래 예시의 `./squid` 자리에 `scripts/squid-sim`을 써도 됩니다. `-f`로 준 squid.conf가 "현재" 설정입니다.
+실행 중인 squid의 캐시 매니저를 조회·기록하는 `scripts/squid-sim -m`은 [MANAGER.md](MANAGER.md)에 있습니다.
 설치(`make install`)는 필요 없고, 실행 중인 squid와 동시에 돌려도 됩니다 (포트를 열지 않음).
 
 ## 로그 준비
