@@ -100,25 +100,24 @@ $B -f /etc/squid/squid.conf --simulate access.log --sim-compare new.conf \
 운영 중인 squid에서 요청 하나가 판정되는 경로입니다. 시뮬레이터가 그대로 쓰는 부분과 대신하는 부분을 이해하는 데 필요합니다.
 
 ```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 420}}}%%
 flowchart TD
-    C(["클라이언트"]) --> A["연결 수락 · 요청 파싱<br/>TcpAcceptor, ConnStateData"]
-    A --> R["HttpRequest<br/>client_addr, my_addr, method, URL"]
-    R --> K["ClientRequestContext::clientAccessCheck()"]
-    K --> F["ACLFilledChecklist<br/>http_access + 요청 + 로그 엔트리"]
-    F -->|"nonBlockingCheck() : 비동기 허용"| T
+    C(["클라이언트 요청"]) --> A["① 연결 수락 · 요청 파싱 (ConnStateData)<br/>HttpRequest: client_addr · my_addr · method · URL"]
+    A --> F["② clientAccessCheck()<br/>ACLFilledChecklist(http_access, 요청) → nonBlockingCheck()"]
+    F --> T
 
-    subgraph T["Acl::Tree — http_access 전체 (OR)"]
+    subgraph T["③ Acl::Tree : http_access 전체 (OR, 위에서부터)"]
         direction LR
-        R1["http_access#1<br/>(AND)"] --> R2["http_access#2<br/>(AND)"] --> RN["…<br/>처음 매칭된 규칙이 판정"]
+        R1["http_access#1<br/>AND"] --> R2["http_access#2<br/>AND"] --> RN["…<br/>처음 매칭된 규칙이 판정"]
     end
 
-    T --> L["개별 ACL<br/>src, dstdomain, port, method, time, url_regex …"]
-    L -.->|"캐시 미스 시 비동기"| D[("DNS<br/>ipcache / fqdncache")]
-    L -.->|"비동기"| H[("helper<br/>external, 인증")]
-    T --> ANS{"판정"}
-    ANS -->|ALLOWED| FW["FwdState<br/>원 서버로 전달"]
-    ANS -->|"DENIED / AUTH_REQUIRED"| ER["오류 페이지 403 / 407"]
-    FW --> LOG[/"access.log (logformat)"/]
+    T --> L["④ 개별 ACL<br/>src · dstdomain · port · method · time · url_regex …"]
+    L -.->|"캐시 미스"| D[("DNS 캐시<br/>비동기 조회")]
+    L -.->|"응답 대기"| H[("helper · 인증<br/>비동기")]
+    T --> ANS{"⑤ 판정"}
+    ANS -->|ALLOWED| FW["원 서버로 전달"]
+    ANS -->|"DENIED · AUTH_REQUIRED"| ER["오류 페이지 403 / 407"]
+    FW --> LOG[/"access.log"/]
     ER --> LOG
 ```
 
@@ -137,17 +136,20 @@ flowchart TD
 판정 로직은 바꾸지 않고, 입력을 로그로 바꾸고 관찰용 훅을 붙였습니다.
 
 ```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 420}}}%%
 flowchart TD
-    LOG[/"access.log 한 줄 (simulformat)"/] --> P["ReadLog() · ParseLine()<br/>Record"]
-    P --> RQ["가짜 HttpRequest<br/>%>a → client_addr · %la → my_addr<br/>%rm %ru → method, URL · %tl → 시각, TZ"]
-    RQ --> F["ACLFilledChecklist<br/>fastCheck() : 동기"]
-    F --> T["Acl::Tree<br/>squid.conf에서 파싱한 원본 그대로"]
-    T -->|"① Tracer 훅"| OBS["규칙·ACL별 결과<br/>1 일치 · 0 불일치 · -1 오프라인 불가"]
-    T -->|"② SkipRulesThrough"| MP["패스 k : 앞 규칙을 건너뛰고<br/>다음 매칭 규칙 찾기"]
-    T -.->|"③ DNS 캐시 미스"| DNS[("ipcache / fqdncache 시뮬레이터 모드<br/>off : 조회 안 함 · system : 동기 조회")]
-    OBS --> DEC["Decision<br/>판정 · 판정 규칙 · 매칭 규칙 전부 · UNSURE ACL"]
-    MP --> DEC
-    DEC --> OUT["터미널 출력 · --sim-compare · --optimize · report.html"]
+    LOG[/"access.log 한 줄 (simulformat)"/] --> RQ["① 가짜 HttpRequest 만들기<br/>%>a → client_addr · %la → my_addr · %rm %ru → method, URL · %tl → 시각"]
+    RQ --> T
+
+    subgraph T["② squid.conf에서 파싱한 Acl::Tree 그대로, fastCheck()로 동기 평가"]
+        direction LR
+        P0["패스 0<br/>실제 판정"] --> P1["패스 1<br/>판정 규칙까지 건너뛰고<br/>다음 매칭 규칙"] --> PK["패스 k …<br/>매칭이 없을 때까지"]
+    end
+
+    T -->|"Tracer 훅"| OBS["규칙 · ACL별 결과<br/>1 일치 · 0 불일치 · -1 오프라인 불가"]
+    T -.->|"DNS 캐시 미스"| DNS[("시뮬레이터 DNS 모드<br/>off: 조회 안 함 · system: 동기 조회")]
+    OBS --> DEC["③ Decision<br/>판정 · 판정 규칙 · 매칭 규칙 전부 · UNSURE ACL"]
+    DEC --> OUT["④ 터미널 · --sim-compare · --optimize · report.html"]
 ```
 
 | 운영 squid | 시뮬레이터 |
