@@ -17,6 +17,23 @@ Squid 소스에 패치로 붙어서, 판정은 Squid 자신의 설정 파서와 
 로그 경로는 시뮬레이터 전용 설정 파일 [`squid-sim.conf`](squid-sim.conf)에서 관리합니다.
 전체 구성도와 기능별 흐름도(판정, 비교, 최적화, 로그 형식, 매니저, 빌드·검증)는 [docs/OVERVIEW.md](docs/OVERVIEW.md)에 모아 두었습니다.
 
+## 이런 질문에 답합니다
+
+| 상황 | 쓰는 기능 |
+|---|---|
+| "이 사용자가 이 사이트에 왜 막혔지? 어느 줄 때문이지?" | `--simulate`: 판정 규칙과 원문 줄, 그 규칙이 없었다면의 결과 |
+| "squid.conf를 이렇게 바꾸면 누가 새로 막히거나 풀리지?" | `--sim-compare new.conf`: 어제 로그를 새 설정으로 다시 돌려 바뀌는 요청만 |
+| "쓰이지 않거나, 겹치거나, 절대 안 걸리는 규칙이 있나?" | `--optimize`: ACL 값까지 비교해 중복·도달 불가·일부 가려진 규칙 |
+| "보고용으로 한 번에 정리해 줘" | `--report out.html`: 위 결과 전체를 HTML 한 파일로 |
+| "지금 실제로 누가 프록시를 쓰고 어떤 도메인 조회가 실패하지?" | `squid-sim -m [--report 60m]`: 실행 중인 squid를 잡음 없이 조회·기록 |
+
+## 목차
+
+- [브랜치](#브랜치) · [빠른 시작](#빠른-시작) · [출력 예시](#출력-예시)
+- [Squid는 http_access를 어떻게 판정하나](#squid는-http_access를-어떻게-판정하나) · [시뮬레이터는 이것을 어떻게 흉내 내나](#시뮬레이터는-이것을-어떻게-흉내-내나)
+- [설계 상세](#설계-상세): 원칙, 구성 요소, 가짜 요청, 관찰 훅, 다중 패스, 시간, DNS, 비교, 최적화, 로그 형식, 매니저, 리포트
+- [squid 4.10과 7.7의 차이](#squid-410과-77의-차이) · [검증 방법](#검증-방법) · [운영 중인 squid에 주는 영향](#운영-중인-squid에-주는-영향) · [정확도와 한계](#정확도와-한계)
+
 ## 브랜치
 
 Squid 내부 API는 메이저 버전마다 달라서, 배포판의 squid 버전마다 브랜치를 나눕니다.
@@ -234,6 +251,186 @@ Squid는 첫 매칭에서 멈추므로, 뒤에서 허용했을 규칙을 알려�
 자세한 설명은 [docs/DESIGN.md](docs/DESIGN.md)에, squid 4.10에서 7.7로 바뀐 API와 훅 위치는 [docs/PORTING-7.7.md](docs/PORTING-7.7.md)에 있습니다.
 
 이 브랜치는 Ubuntu 26.04 패키지와 같은 squid를 만들기 위해 업스트림 7.7 소스(Ubuntu의 orig tarball과 동일)에 Ubuntu 자체 패치 4개(기본 설정과 `internal.cc` 수정)를 먼저 적용합니다. squid 7부터는 `CONNECT`도 내장 ACL이라, squid.conf에서 다시 선언하면 `--optimize`가 `built-in ACL redefined`로 알려줍니다.
+
+## 설계 상세
+
+### 설계 원칙
+
+| 원칙 | 이유 | 구현 |
+|---|---|---|
+| 판정 로직을 다시 만들지 않는다 | ACL 문법·매칭 규칙을 재구현하면 버전마다 미묘하게 달라지고, 그 차이가 곧 오판이 된다 | 시뮬레이터는 Squid 자신의 설정 파서와 `ACLChecklist::fastCheck()`를 그대로 호출하고, 입력과 관찰만 바꾼다 |
+| 훅은 기본값에서 아무 일도 하지 않는다 | 같은 바이너리를 운영 squid로 써도 동작이 같아야 한다 | 모든 훅은 `nullptr`, `-1`, `false`, `0`이 기본이고, `--simulate`·`--optimize`일 때만 켜진다 |
+| 빌드 시스템을 고치지 않는다 | 배포판 configure 옵션 그대로 빌드해야 배포판 squid와 비교할 수 있다 | 새 코드는 `main.cc`가 `#include` 하는 `AclSimulator.cci` 한 파일. `make check`의 헤더 단독 컴파일도 피한다 |
+| 운영 중인 squid를 건드리지 않는다 | 운영 서버에서 바로 돌려 볼 수 있어야 한다 | 설정 파싱 직후, PID 파일·포트·캐시·`cache_log`를 열기 전에 갈라진다 |
+| 모르는 것은 추측하지 않는다 | 틀린 확신이 모르는 것보다 위험하다 | 로그에 없는 정보가 필요한 ACL은 `UNSURE`, 값을 읽지 못한 ACL은 비교에서 뺀다 |
+
+### 구성 요소
+
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 420}}}%%
+flowchart LR
+    subgraph PY["scripts/squid-sim (Python, 표준 라이브러리만)"]
+        direction TB
+        CONF["squid-sim.conf · squid.conf 읽기"] --> FMT["로그 형식 판별 · simulformat 변환"]
+        MGR["캐시 매니저 조회 · 기록"]
+    end
+    subgraph SQ["패치한 squid 바이너리"]
+        direction TB
+        PARSE["Squid 원본 설정 파서<br/>+ 파서 노트 훅"] --> SIM["AclSimulator::Run()<br/>재생 · 비교 · 최적화 · 리포트"]
+        SIM --> ENG["Squid 원본 ACL 엔진<br/>+ Tracer · SkipRulesThrough 훅"]
+        ENG --> DNS["ipcache · fqdncache<br/>+ 시뮬레이터 DNS 모드"]
+    end
+    FMT -->|"--simulate 사본"| PARSE
+    MGR -->|"읽기 전용 GET"| RUN[("실행 중인 squid")]
+```
+
+두 층으로 나눈 이유는 역할이 다르기 때문입니다. **판정**은 Squid 내부 API가 필요해 C++ 패치로, **로그 형식·설정 파일·매니저**처럼
+Squid 버전과 무관한 일은 Python 한 파일로 두었습니다. 그래서 4.10과 7.7 브랜치는 C++ 패치만 다르고 `squid-sim`은 같습니다.
+
+### 1. 로그 한 줄을 가짜 요청으로
+
+`ReadLog()`가 `simulformat` 줄을 위치로 읽어 `Record`를 만들고, `Evaluate()`가 운영 squid가 소켓에서 만들었을 `HttpRequest`를 재구성합니다.
+
+| 로그 필드 | 들어가는 곳 | 영향받는 ACL |
+|---|---|---|
+| `%>a` | `request->client_addr`, `indirect_client_addr`, `al->cache.caddr` | `src`, `srcdomain` |
+| `%la` + `--sim-port`(기본 첫 `http_port`) | `request->my_addr` | `localip`(`myip`), `localport` |
+| 그 포트의 `http_port name=` | `request->myportname` | `myportname` |
+| `%rm`, `%ru` | `HttpRequest::FromUrl()` (CONNECT는 `호스트:포트`) | `method`, `dstdomain`, `dst`, `port`, `proto`, `url_regex`, `urlpath_regex` |
+| `%rv` | `request->http_ver` | — |
+| `%tl` | `squid_curtime`, `current_time`, 프로세스 `TZ` | `time` |
+| `%Ss` | 입력에는 쓰지 않고, 판정과 비교(`same`/`DIFF`)에만 | — |
+
+읽을 수 없는 줄도 버리지 않고 줄 번호와 함께 `SKIP`으로 남겨, 결과의 줄 번호가 원본 로그와 항상 같습니다.
+
+### 2. 엔진 관찰: `ACLChecklist::Tracer`
+
+Squid는 `http_access` 줄들을 OR 트리(`Acl::Tree`) 아래 줄마다 AND 노드(`http_access#N`)로 만들고, 자식을 평가할 때마다
+`ACLChecklist::matchChild()`를 거칩니다. 여기에 정적 함수 포인터 `Tracer(부모, 노드, 결과)` 호출을 넣었습니다.
+
+- 부모가 트리인 이벤트 = **규칙 단위 결과**, 부모가 규칙인 이벤트 = **ACL 단위 결과**입니다. AND 노드는 첫 불일치에서 멈추므로
+  기록도 Squid의 단락 평가 순서를 그대로 따릅니다(`--sim-trace`, 리포트의 평가 과정).
+- `fastCheck()`에서 비동기 조회가 필요해 `goAsync()`가 거절되면 결과 `-1`을 보내고, 그 ACL을 `UNSURE`로 표시합니다.
+- 로그에 없는 데이터를 보는 32개 타입(`browser`, `req_header`, `proxy_auth`, `external`, `maxconn`, `note` 등)은 결과가 나와도 `UNSURE`입니다.
+- `UNSURE`는 **패스 0에서 판정 규칙까지 실제로 평가된 ACL만**으로 정합니다. 판정에 영향을 줄 수 없는 ACL로 경고하지 않기 위해서입니다.
+  AUTH·DUNNO로 끝났으면 그 판정을 낸 ACL을, 로그 시각이 없으면 평가된 `time` ACL을 더합니다.
+
+### 3. 매칭되는 모든 규칙: `SkipRulesThrough`
+
+Squid는 첫 매칭에서 멈추므로, 뒤에서 매칭될 규칙을 알려면 다시 평가해야 합니다. `OrNode::doMatch()`는 규칙마다
+`Acl::Tree::bannedAction()`에 "이 규칙을 건너뛸까"를 묻는데, 여기에 위치 조건 하나를 더했습니다.
+
+```cpp
+if (ACLChecklist::SkipRulesThrough >= 0 && pos <= SkipRulesThrough)
+    return true;
+```
+
+패스 k는 `SkipRulesThrough`를 직전 승자의 위치로 두고 다시 `fastCheck()`합니다. 승자 앞 규칙은 이미 불일치였으므로
+"승자까지 건너뛰기"는 "승자 다음부터 계속"과 같습니다. 매칭이 없으면 멈추고, AUTH·DUNNO처럼 예외 응답이 나오면 그 규칙을
+`#2 auth`처럼 사슬에 넣고 멈춥니다(Squid도 거기서 검사를 끝내고 인증을 요구하기 때문). 비용은 요청당 (매칭 규칙 수 + 1)번의 평가입니다.
+
+### 4. 시간
+
+`%tl`을 UTC epoch로 바꿔 `squid_curtime`에 넣고, 프로세스 `TZ`를 로그의 오프셋(예: `SIM-09:00`, POSIX TZ는 부호가 반대)으로 맞춥니다.
+`acl time`은 `localtime(squid_curtime)`을 쓰므로, 시뮬레이터 서버의 타임존과 관계없이 **프록시가 본 현지 시각**으로 판정합니다.
+Squid의 `debugs()`가 로그를 남길 때마다 시계를 현재로 되돌리므로, 매 패스 직전에 로그 시각을 다시 넣습니다.
+
+### 5. 오프라인 DNS
+
+`dst`, `srcdomain`, IP URL의 `dstdomain`은 평소 비동기 DNS를 기다립니다. 시뮬레이터는 이벤트 루프를 돌리지 않으므로
+`ipcache_gethostbyname()`·`fqdncache_gethostbyaddr()`의 캐시 미스 분기만 바꿨습니다.
+
+| 모드 | 동작 |
+|---|---|
+| `--sim-dns off` (기본) | 조회하지 않음. `hosts_file` 항목은 미리 캐시에 있어 동작하고, 나머지는 `UNSURE` |
+| `--sim-dns system` | `getaddrinfo()`/`getnameinfo()`로 동기 조회해 고정 항목으로 캐시. 실패한 이름도 기억해 다시 막히지 않음. 체크리스트에 "조회 완료"를 표시해 실패는 운영 squid처럼 불일치로 처리 |
+| 운영 squid (옵션 없음) | 원래의 비동기 조회 그대로 (모드 0) |
+
+### 6. 설정 비교: `--sim-compare`
+
+같은 프로세스에서 로그를 한 번만 읽고, 현재 설정으로 재생한 뒤 **새 squid.conf를 다시 파싱**해 같은 `Records`를 재생합니다.
+
+- 두 번째 파싱 전에 파서 노트, 참조 수, `hosts_file` 캐시 항목을 비워 첫 설정의 흔적이 남지 않게 합니다.
+- 목적지 "호스트:포트"는 설정(`append_domain` 등)에 따라 다를 수 있어 판정마다 따로 보관합니다.
+- 규칙을 추가하면 번호가 밀리므로, 바뀜 여부는 규칙 **번호가 아니라 규칙 줄 텍스트**(`treeDump()` 결과, 이어 쓴 줄도 한 줄로)로 판단합니다.
+- 결과는 판정이 바뀐 요청(`VERDICT`)과 판정은 같고 판정 규칙만 바뀐 요청(`rule`)으로 나눕니다.
+
+### 7. 최적화: `--optimize`
+
+세 가지 정보원을 씁니다.
+
+1. **파서 노트.** 별도 파서를 만들지 않고, Squid 파서가 이미 cache.log에 경고를 내는 자리(포함된 값, 중복 값, 병합된 범위,
+   내장 ACL 재정의)에서 `Acl::NoteConfig()`로 파일:줄과 함께 기록합니다. 파일에서 읽은 값(`"/etc/squid/blocked.txt"`)도 포함됩니다.
+2. **ACL 값.** squid가 `dump()`하는 값을 타입별로 바꿔 같은 타입끼리 비교합니다. 주소는 IPv4를 `::ffff:` 매핑한 128비트 범위로
+   병합해 이분 탐색하고, 도메인은 접미사마다 집합을 조회하므로 5만 개짜리 목록 두 개와 ACL 300개를 비교해도 약 2.5초입니다.
+3. **규칙 구조.** 앞 규칙의 조건 하나하나가 뒤 규칙의 어떤 조건으로 보장되면, 뒤 규칙은 판정할 기회가 없습니다.
+
+| 앞 규칙 조건 | 뒤 규칙 조건 | 보장되는 경우 |
+|---|---|---|
+| `A` | `A` | 항상 |
+| `A` | `B` | `B`의 값이 모두 `A`에 있음 |
+| `!A` | `!B` | `A`의 값이 모두 `B`에 있음 |
+| `!A` | `B` | 공통 값이 없음 (`dst`·`srcdomain`, IP 값이 있는 `dstdomain`은 한 요청이 둘 다에 매칭될 수 있어 제외) |
+
+같은 동작이면 `redundant rule`, 반대 동작이면 `unreachable rule`입니다. 그 규칙이 마지막이라 implicit 판정을 정하고 있으면
+지우라고 하지 않고 반대 동작의 `all` 규칙으로 바꾸라고 권합니다. 로그를 함께 주면 "어떤 요청에도 매칭되지 않음",
+"매칭은 됐지만 판정한 적 없음"도 찾습니다.
+
+### 8. 로그 형식 변환: `scripts/squid-sim`
+
+squid 바이너리는 `simulformat` 한 가지만 읽고, 나머지 형식은 Python 쪽에서 바꿉니다. C++ 파서를 단순하게 두고, 형식 처리를
+버전과 무관하게 한 곳에서 하기 위해서입니다.
+
+1. squid의 `logformat` 문법(인코딩·너비 수식어, `{인자}`, `%%`)을 리터럴과 필드로 나누고, 알려진 코드 중 가장 긴 것부터 맞춥니다
+   (`%Ss/%03>Hs`가 `Ss`, `/`, `>Hs`로 나뉘도록).
+2. 필드마다 문맥에 맞는 정규식을 만듭니다: 시각은 그 strftime 형식에서, 따옴표 인코딩 값은 이스케이프를 허용해서,
+   뒤에 붙은 리터럴 문자는 값에서 제외해서.
+3. 처음 50줄로 형식을 고르고, 맞지 않는 줄은 따옴표를 바꿔 squid가 `SKIP`으로 보고하게 남깁니다. 주석·빈 줄은 그대로 둬 줄 번호를 유지합니다.
+4. 사본은 개인 임시 폴더에 쓰고, squid를 자식 프로세스로 실행하며 받은 신호를 넘긴 뒤 지웁니다.
+
+### 9. 캐시 매니저: `squid-sim -m`
+
+| 설계 | 이유 |
+|---|---|
+| 읽기 전용 GET만, 상태를 바꾸는 페이지는 거부 | 운영 squid에 실수로 `shutdown`을 보내지 않도록 |
+| 환경 변수의 프록시를 쓰지 않고 squid에 직접 연결 | 프록시 설정 때문에 다른 squid를 조회하지 않도록 |
+| loopback, 자기 출발 주소, `/etc/hosts` 항목, 매니저 조회 자신을 제외 | 기록 자체가 트래픽으로 잡히지 않도록. 출발 주소는 UDP `connect()`로 구해 패킷을 보내지 않음 |
+| 카운터는 이웃한 조회의 차이로, 자기 조회 수를 빼고 | 누적값이 아니라 기록 구간의 트래픽을 보여 주기 위해 |
+| 가동 시간이나 요청 수가 줄면 재시작으로 보고 그 구간을 뺌 | 재시작 뒤 음수나 과대 집계를 막기 위해 |
+| squid 5+의 `by kidN { … }` 블록을 합침 | SMP 출력도 4.10과 같은 형식으로 |
+
+### 10. 리포트
+
+요청을 (클라이언트, 메서드, 목적지, 판정, 판정 규칙[, 새 판정, 새 규칙]) 묶음으로 세고, 묶음마다 평가 과정 하나만 보관합니다.
+큰 로그에서도 열리도록 표마다 5,000행에서 자르고, 외부 파일 없이 HTML 한 파일(라이트/다크, 검색·필터)로 씁니다.
+
+## squid 4.10과 7.7의 차이
+
+설계는 같고, Squid 내부 API가 달라 C++ 패치만 브랜치마다 다릅니다(`scripts/squid-sim`, 테스트, 문서는 같음).
+
+| 항목 | squid 4.10 (`main`) | squid 7.7 (`ubuntu-26.04-squid-7.7`) |
+|---|---|---|
+| 판정 결과 타입 | `allow_t` | `Acl::Answer` |
+| ACL 노드 | `ACL` (이름은 `char[]`) | `Acl::Node` (이름은 `SBuf`) |
+| ACL 목록 | `Config.aclList` 연결 리스트 (나중 정의가 앞) | 이름 해시라 순서가 없음 → 정의 순서를 `AclDefinitionOrder`에 기록 |
+| 포함·중복 경고 지점 | `DomainData.cc`, `Ip.cc` | `SplayInserter::Merge()` (겹친 범위 병합 노트 추가) |
+| URL 포트 | `int` | `std::optional` |
+| `cache_log` | 설정 파싱 중에 열림 → 시뮬레이터에서 막음 | 시뮬레이터 분기 뒤에 열려 수정 불필요 |
+| 빌드 | 공식 tarball + 시뮬레이터 패치 | 공식 tarball + Ubuntu 패치 4개 + 시뮬레이터 패치 (`-Wextra -Werror`) |
+| 캐시 매니저 출력 | 한 덩어리 | 워커별 `by kidN { … }` 블록 |
+
+## 검증 방법
+
+| 단계 | 무엇을 확인하나 |
+|---|---|
+| `make check` | 패치 뒤에도 Squid 자체 단위 테스트(4.10: 94개, 7.7: 103개)와 헤더 단독 컴파일이 통과하는지 |
+| `scripts/test.sh` | 테스트 설정·로그로 요청별 판정, 매칭 사슬, 설정 비교, 최적화 결과, ACL 값 비교, 리포트, 로그 형식 변환(`squid` 형식, `%tg`, gzip, 표준 입력)이 기대값과 같은지. 모든 실행의 종료 코드도 확인 (4.10: 49개, 7.7: 54개) |
+| `-k parse` 비교 | 같은 설정을 배포판 squid와 패치한 squid가 똑같이 받아들이는지 |
+| 운영 squid 무영향 | 시뮬레이터 실행 전후로 실행 중인 squid의 PID, 시작 시각, 재시작 횟수, cache.log 크기가 같은지 |
+| 캐시 매니저 | 실제로 페이지를 해석했는지(버전, 카운터)와 기록이 스냅숏 2개 이상을 남기는지 |
+
+`scripts/verify-target.sh`가 이 모두를 대상 OS에서 한 번에 실행합니다. 두 번의 전체 재검토에서 찾아 고친 결함과 시나리오별 확인 결과는
+[docs/DESIGN-VERIFICATION.md](docs/DESIGN-VERIFICATION.md)와 [docs/VERIFICATION.md](docs/VERIFICATION.md)에 있습니다.
 
 ## 운영 중인 squid에 주는 영향
 
