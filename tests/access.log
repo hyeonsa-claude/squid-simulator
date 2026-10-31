@@ -1,0 +1,14 @@
+# Test log: logformat custom %tl %la %>a  "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh
+# 31/Oct/2026 is a Saturday, 02/Nov/2026 a Monday. Times are proxy local time (+0900).
+02/Nov/2026:10:00:00 +0900 192.168.0.1 10.0.0.5  "GET http://www.example.com/ HTTP/1.1" 200 1024 TCP_MISS:HIER_DIRECT
+02/Nov/2026:10:00:01 +0900 192.168.0.1 10.0.0.5  "GET http://x.ads.example.com/a.js HTTP/1.1" 403 3500 TCP_DENIED:HIER_NONE
+02/Nov/2026:10:00:02 +0900 192.168.0.1 10.0.0.5  "GET http://www.example.com:8080/ HTTP/1.1" 403 3500 TCP_DENIED:HIER_NONE
+02/Nov/2026:10:00:03 +0900 192.168.0.1 10.0.0.5  "CONNECT www.example.com:443 HTTP/1.1" 200 5000 TCP_TUNNEL:HIER_DIRECT
+02/Nov/2026:10:00:04 +0900 192.168.0.1 10.0.0.5  "CONNECT www.example.com:8443 HTTP/1.1" 403 3500 TCP_DENIED:HIER_NONE
+02/Nov/2026:10:00:05 +0900 192.168.0.1 10.0.0.5  "GET http://www.facebook.com/ HTTP/1.1" 403 3500 TCP_DENIED:HIER_NONE
+31/Oct/2026:10:00:06 +0900 192.168.0.1 10.0.0.5  "GET http://www.facebook.com/ HTTP/1.1" 200 2048 TCP_MISS:HIER_DIRECT
+02/Nov/2026:10:00:07 +0900 192.168.0.1 192.168.1.10  "GET http://www.example.com/ HTTP/1.1" 403 3500 TCP_DENIED:HIER_NONE
+this line is not an access.log line
+02/Nov/2026:10:00:09 +0900 192.168.0.1 10.0.0.5  "NONE error:invalid-request HTTP/0.0" 400 4000 NONE_NONE:HIER_NONE
+02/Nov/2026:10:00:10 +0900 192.168.0.1 10.0.0.5  "GET http://y.ads.example.com/ HTTP/1.1" 200 1024 TCP_MISS:HIER_DIRECT
+02/Nov/2026:10:00:11 +0900 192.168.0.1 10.20.30.40  "GET https://www.dup.example/ HTTP/1.1" 200 1024 TCP_MISS:HIER_DIRECT

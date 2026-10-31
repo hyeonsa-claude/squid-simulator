@@ -1,0 +1,2226 @@
+--- /dev/null
++++ b/src/AclSimulator.cci
+@@ -0,0 +1,1567 @@
++/*
++ * Copyright (C) 1996-2020 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++/* DEBUG: section 28    Access Control (offline simulator) */
++
++#ifndef SQUID_ACLSIMULATOR_H
++#define SQUID_ACLSIMULATOR_H
++
++/*
++ * Offline http_access simulator (squid --simulate access.log).
++ *
++ * Replays access.log lines written with
++ *   logformat custom %tl %la %>a "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh
++ * through the http_access rules of the parsed squid.conf and reports, for
++ * every request, the deciding rule and every other rule that also matches.
++ * No sockets are opened and nothing is forwarded.
++ *
++ * --sim-compare new.conf replays the same log through a second squid.conf
++ * and lists the requests whose verdict or deciding rule changes.
++ * --report out.html writes a self-contained HTML report.
++ *
++ * Included by main.cc only (single translation unit), so no build system
++ * changes are needed.
++ */
++
++#include "AccessLogEntry.h"
++#include "acl/BoolOps.h"
++#include "acl/FilledChecklist.h"
++#include "acl/Tree.h"
++#include "anyp/PortCfg.h"
++#include "cache_cf.h"
++#include "ConfigParser.h"
++#include "fqdncache.h"
++#include "globals.h"
++#include "http/ProtocolVersion.h"
++#include "HttpRequest.h"
++#include "ipcache.h"
++#include "MasterXaction.h"
++#include "SquidConfig.h"
++#include "SquidTime.h"
++#include "tools.h"
++
++#include <algorithm>
++#include <climits>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <fstream>
++#include <iostream>
++#include <map>
++#include <set>
++#include <sstream>
++#include <string>
++#include <vector>
++#if HAVE_UNISTD_H
++#include <unistd.h>
++#endif
++
++namespace AclSimulator
++{
++
++static const char *LogFile = nullptr; ///< --simulate FILE ("-" is stdin)
++static const char *CompareConf = nullptr; ///< --sim-compare FILE
++static const char *ReportFile = nullptr; ///< --report FILE
++static bool Optimize = false; ///< --optimize
++static bool ShowTrace = false; ///< --sim-trace
++static int DnsMode = 1; ///< --sim-dns: 1 = off (hosts_file only), 2 = system resolver
++static int LocalPortOption = -1; ///< --sim-port; defaults to the first http_port
++
++/// at most this many rows per HTML report table
++static const size_t ReportRowLimit = 5000;
++
++/// one access.log line
++class Record
++{
++public:
++    unsigned lineNo = 0;
++    bool parsed = false;
++    bool hasTime = false;
++    time_t when = 0;
++    int tzOffset = 0; ///< seconds east of UTC, from %tl
++    std::string localIp, clientIp, method, url, version, host;
++    std::string status, squidStatus;
++};
++
++/// a rule that matched a request
++class RuleMatch
++{
++public:
++    std::string name; ///< http_access#N
++    std::string action; ///< allow, deny, or ? for exceptional answers
++    std::string text; ///< squid.conf line
++};
++
++/// how one squid.conf treats one request
++class Decision
++{
++public:
++    std::string verdict = "SKIP"; ///< ALLOW, DENY, AUTH, DUNNO, SKIP
++    std::string rule = "-"; ///< http_access#N, implicit, or -
++    std::string ruleText;
++    std::vector<RuleMatch> matches; ///< all matching rules in order; [0] decides unless implicit
++    std::string unsure; ///< ACLs that need lookups we cannot do offline
++    std::string trace; ///< rule-by-rule evaluation (kept for --sim-trace and the report)
++    std::string vsLog = "n/a"; ///< same, DIFF, UNSURE, n/a (current config only)
++};
++
++/// a configured http_access rule
++class RuleInfo
++{
++public:
++    std::string name;
++    std::string action;
++    std::string text;
++    std::vector<std::string> acls; ///< ACL names, "!name" when negated
++    unsigned decided = 0; ///< requests this rule decided
++    unsigned shadowed = 0; ///< requests it matched after an earlier rule decided
++};
++
++/// an --optimize result
++class Finding
++{
++public:
++    int severity; ///< 3 high, 2 medium, 1 low
++    std::string category;
++    std::string subject; ///< ACL or rule name
++    std::string where; ///< file:line or the squid.conf line
++    std::string message;
++    std::string fix;
++};
++
++/// results of replaying the log through one squid.conf
++class ConfigRun
++{
++public:
++    std::string path;
++    std::vector<RuleInfo> rules;
++    std::vector<Finding> findings; ///< --optimize results
++    std::vector<Decision> decisions; ///< parallel to Records
++    std::map<std::string, size_t> traceAt; ///< group key -> decision index holding its trace
++    unsigned allowed = 0, denied = 0, other = 0, skipped = 0, unsure = 0, differ = 0;
++    unsigned implicitHits = 0;
++};
++
++static std::vector<Record> Records;
++static ConfigRun Runs[2]; ///< current and (with --sim-compare) new squid.conf
++static bool Color = false; ///< ANSI colors on a terminal
++
++/// one evaluated ACL tree node, reported by ACLChecklist::Tracer
++class Step
++{
++public:
++    const Acl::InnerNode *parent;
++    const ACL *node;
++    int result; ///< 1 match, 0 mismatch
++};
++
++static std::vector<Step> Steps; ///< evaluation order of the current check
++/// ACLs whose result offline is a guess: they wanted an async lookup or
++/// they test data that the access.log format does not record
++static std::set<std::string> Skipped;
++
++/// ACL types that test data missing from "%tl %la %>a "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh"
++static const std::set<std::string> NoLogData = {
++    "browser", "referer_regex", "req_header", "req_mime_type", "rep_header", "rep_mime_type",
++    "http_status", "hier_code", "peername", "peername_regex", "maxconn", "max_user_ip",
++    "proxy_auth", "proxy_auth_regex", "ident", "ident_regex", "external", "ext_user", "ext_user_regex",
++    "user_cert", "ca_cert", "ssl_error", "server_cert_fingerprint", "at_step", "note", "tag",
++    "clientside_mark", "client_connection_mark", "adaptation_service", "arp", "eui64", "random"
++};
++
++static void
++Trace(const ACLChecklist *, const Acl::InnerNode *parent, const ACL *child, int result)
++{
++    if (result < 0 || NoLogData.count(child->typeString())) {
++        Skipped.insert(child->name);
++        if (result < 0)
++            return;
++    }
++    Steps.push_back(Step{parent, child, result});
++}
++
++/* access.log parsing */
++
++static int
++MonthNumber(const char *mon)
++{
++    static const char *names[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
++                                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
++                                 };
++    for (int i = 0; i < 12; ++i) {
++        if (strcasecmp(mon, names[i]) == 0)
++            return i;
++    }
++    return -1;
++}
++
++/// parses %tl ("31/Oct/2026:09:59:01" "+0900")
++static bool
++ParseTime(const std::string &date, const std::string &zone, Record &r)
++{
++    int day, year, hh, mm, ss;
++    char mon[4];
++    if (sscanf(date.c_str(), "%d/%3[A-Za-z]/%d:%d:%d:%d", &day, mon, &year, &hh, &mm, &ss) != 6)
++        return false;
++    const int month = MonthNumber(mon);
++    if (month < 0 || zone.size() != 5 || (zone[0] != '+' && zone[0] != '-'))
++        return false;
++
++    struct tm tm;
++    memset(&tm, 0, sizeof(tm));
++    tm.tm_mday = day;
++    tm.tm_mon = month;
++    tm.tm_year = year - 1900;
++    tm.tm_hour = hh;
++    tm.tm_min = mm;
++    tm.tm_sec = ss;
++
++    const int zh = atoi(zone.substr(1, 2).c_str());
++    const int zm = atoi(zone.substr(3, 2).c_str());
++    r.tzOffset = (zone[0] == '-' ? -1 : 1) * (zh * 3600 + zm * 60);
++    r.when = timegm(&tm) - r.tzOffset;
++    r.hasTime = true;
++    return true;
++}
++
++/// parses: %tl %la %>a "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh
++static bool
++ParseLine(const std::string &line, Record &r)
++{
++    const auto q1 = line.find('"');
++    const auto q2 = line.rfind('"');
++    if (q1 == std::string::npos || q2 == q1)
++        return false;
++
++    std::istringstream head(line.substr(0, q1));
++    std::string date, zone;
++    head >> date >> zone >> r.localIp >> r.clientIp;
++    if (r.clientIp.empty())
++        return false;
++    (void)ParseTime(date, zone, r);
++
++    std::istringstream req(line.substr(q1 + 1, q2 - q1 - 1));
++    std::vector<std::string> words;
++    for (std::string w; req >> w;)
++        words.push_back(w);
++    if (words.size() < 2)
++        return false;
++    if (words.size() >= 3 && words.back().compare(0, 5, "HTTP/") == 0) {
++        r.version = words.back().substr(5);
++        words.pop_back();
++    }
++    r.method = words[0];
++    r.url = words[1];
++    for (size_t i = 2; i < words.size(); ++i)
++        r.url += " " + words[i];
++    r.host = r.url;
++
++    std::istringstream tail(line.substr(q2 + 1));
++    std::string size, tags;
++    tail >> r.status >> size >> tags;
++    r.squidStatus = tags.substr(0, tags.find(':'));
++    return true;
++}
++
++/* helpers */
++
++/// makes localtime() (and thus "acl time") use the proxy's logged UTC offset
++static void
++UseLogTimezone(const int offset)
++{
++    static int current = INT_MIN;
++    if (offset == current)
++        return;
++    current = offset;
++    const int a = offset < 0 ? -offset : offset;
++    char tz[32];
++    // POSIX TZ offsets count west of UTC, hence the inverted sign
++    snprintf(tz, sizeof(tz), "SIM%c%02d:%02d", offset > 0 ? '-' : '+', a / 3600, (a % 3600) / 60);
++    setenv("TZ", tz, 1);
++    tzset();
++}
++
++/// what Squid logged for this request: "DENY", "ALLOW", or "" (unknown)
++static const char *
++LoggedVerdict(const Record &r)
++{
++    const std::string &s = r.squidStatus;
++    if (s.compare(0, 10, "TCP_DENIED") == 0 && s != "TCP_DENIED_REPLY")
++        return "DENY";
++    if (s.empty() || s == "-" || s.compare(0, 4, "NONE") == 0 || s.compare(0, 8, "TAG_NONE") == 0)
++        return "";
++    return "ALLOW";
++}
++
++static const char *
++VerdictName(const allow_t &answer)
++{
++    if (answer.allowed())
++        return "ALLOW";
++    if (answer.denied())
++        return "DENY";
++    if (answer == ACCESS_AUTH_REQUIRED)
++        return "AUTH";
++    return "DUNNO";
++}
++
++/// zero-based position of a rule from its "http_access#N" name
++static int
++RulePosition(const std::string &name)
++{
++    const auto hash = name.rfind('#');
++    return hash == std::string::npos ? -1 : atoi(name.c_str() + hash + 1) - 1;
++}
++
++/// "http_access#5" -> "#5"
++static std::string
++Short(const std::string &name)
++{
++    const auto hash = name.rfind('#');
++    return hash == std::string::npos ? name : name.substr(hash);
++}
++
++static std::string
++Upper(std::string s)
++{
++    for (auto &c : s)
++        c = toupper(static_cast<unsigned char>(c));
++    return s;
++}
++
++static std::string
++Lower(std::string s)
++{
++    for (auto &c : s)
++        c = tolower(static_cast<unsigned char>(c));
++    return s;
++}
++
++static std::string
++Paint(const std::string &s, const char *code)
++{
++    return Color ? "\033[" + std::string(code) + "m" + s + "\033[0m" : s;
++}
++
++static const char *
++VerdictColor(const std::string &verdict)
++{
++    if (verdict == "ALLOW")
++        return "1;32";
++    if (verdict == "DENY")
++        return "1;31";
++    return "1;33";
++}
++
++static std::string
++Pad(std::string s, const size_t width)
++{
++    if (s.size() < width)
++        s.append(width - s.size(), ' ');
++    return s;
++}
++
++/// the answer when no rule matches: the opposite of the last rule action;
++/// the rule named by without is treated as deleted
++static std::string
++ImplicitVerdict(const ConfigRun &run, const std::string &without = std::string())
++{
++    for (auto rule = run.rules.rbegin(); rule != run.rules.rend(); ++rule) {
++        if (rule->name != without)
++            return rule->action == "allow" ? "DENY" : "ALLOW";
++    }
++    return "DUNNO";
++}
++
++/// what would happen if the deciding rule were removed
++static std::string
++WithoutDecisive(const Decision &d, const ConfigRun &run)
++{
++    if (d.matches.size() >= 2)
++        return Upper(d.matches[1].action) + " by " + d.matches[1].name;
++    return ImplicitVerdict(run, d.rule) + " by implicit rule";
++}
++
++/// "#5 deny > #9 allow > #12 allow"
++static std::string
++MatchChain(const Decision &d)
++{
++    if (d.matches.empty())
++        return "none";
++    std::string chain;
++    for (const auto &m : d.matches) {
++        if (!chain.empty())
++            chain += " > ";
++        chain += Short(m.name) + " " + m.action;
++    }
++    return chain;
++}
++
++static std::string
++FirstMatching(const Decision &d, const char *action)
++{
++    for (const auto &m : d.matches) {
++        if (m.action == action)
++            return m.name;
++    }
++    return "";
++}
++
++static bool
++WasSkipped(const ACL *node)
++{
++    const char *name = node->name;
++    return Skipped.count(name) || (name[0] == '!' && Skipped.count(name + 1));
++}
++
++/// rule-by-rule evaluation of the last check
++static std::string
++FormatTrace(const Acl::Tree *tree)
++{
++    std::ostringstream out;
++    std::vector<const Step *> leaves;
++    for (const auto &step : Steps) {
++        if (step.parent != tree) {
++            leaves.push_back(&step);
++            continue;
++        }
++        out << "             " << Pad(Short(step.node->name), 5) <<
++            (step.result ? " MATCH " : " no    ");
++        for (const auto *leaf : leaves) {
++            if (leaf->parent != step.node)
++                continue; // nested any-of/all-of/!acl internals
++            out << " " << leaf->node->name << "=" <<
++                (WasSkipped(leaf->node) ? "?" : (leaf->result ? "yes" : "no"));
++        }
++        out << "   [" << (step.node->cfgline ? step.node->cfgline : "") << "]\n";
++        leaves.clear();
++    }
++    return out.str();
++}
++
++/// every configured rule, from the parsed tree
++static std::vector<RuleInfo>
++CollectRules(const Acl::Tree *tree)
++{
++    std::vector<RuleInfo> result;
++    const SBufList dump = tree->treeDump("http_access", [](const allow_t &a) {
++        return a.allowed() ? "allow" : "deny";
++    });
++    static const SBuf NewLine("\n");
++    RuleInfo rule;
++    size_t tokens = 0;
++    for (const auto &token : dump) {
++        if (!(token == NewLine)) {
++            if (++tokens == 2)
++                rule.action = token.toStdString();
++            else if (tokens > 2)
++                rule.acls.push_back(token.toStdString());
++            if (!rule.text.empty())
++                rule.text += " ";
++            rule.text += token.toStdString();
++            continue;
++        }
++        rule.name = "http_access#" + std::to_string(result.size() + 1);
++        result.push_back(rule);
++        rule = RuleInfo();
++        tokens = 0;
++    }
++    return result;
++}
++
++/* evaluation */
++
++static void
++CountDecision(ConfigRun &run, const Decision &d)
++{
++    if (d.verdict == "ALLOW")
++        ++run.allowed;
++    else if (d.verdict == "DENY")
++        ++run.denied;
++    else if (d.verdict == "SKIP")
++        ++run.skipped;
++    else
++        ++run.other;
++    if (!d.unsure.empty())
++        ++run.unsure;
++    if (d.vsLog == "DIFF")
++        ++run.differ;
++
++    // the deciding rule may have no match entry (e.g., it ended the check with AUTH)
++    const int decisive = d.rule == "implicit" ? -1 : RulePosition(d.rule);
++    if (d.rule == "implicit")
++        ++run.implicitHits;
++    else if (decisive >= 0 && size_t(decisive) < run.rules.size())
++        ++run.rules[decisive].decided;
++    for (size_t i = 0; i < d.matches.size(); ++i) {
++        const int pos = RulePosition(d.matches[i].name);
++        if (pos < 0 || size_t(pos) >= run.rules.size() || (i == 0 && pos == decisive))
++            continue;
++        ++run.rules[pos].shadowed;
++    }
++}
++
++/// replays one record through the current http_access rules
++static Decision
++Evaluate(Record &r, ConfigRun &run, const bool current, const int localPort)
++{
++    Decision d;
++    if (!r.parsed) {
++        d.ruleText = "unparsable log line";
++        return d;
++    }
++
++    Acl::Tree *tree = Config.accessList.http;
++
++    HttpRequestMethod method;
++    method.HttpRequestMethodXXX(r.method.c_str());
++    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initClient);
++    HttpRequest::Pointer request(HttpRequest::FromUrl(SBuf(r.url.c_str()), mx, method));
++    if (!request) {
++        d.ruleText = "unparsable URL";
++        return d;
++    }
++    r.host = std::string(request->url.host()) + ":" + std::to_string(request->url.port());
++
++    unsigned vMajor = 1, vMinor = 1;
++    if (sscanf(r.version.c_str(), "%u.%u", &vMajor, &vMinor) == 2)
++        request->http_ver = Http::ProtocolVersion(vMajor, vMinor);
++
++    if (!(request->client_addr = r.clientIp.c_str()))
++        request->client_addr.setNoAddr();
++#if FOLLOW_X_FORWARDED_FOR
++    request->indirect_client_addr = request->client_addr;
++#endif
++    if (!(request->my_addr = r.localIp.c_str()))
++        request->my_addr.setAnyAddr();
++    request->my_addr.port(localPort);
++    // myportname: the http_port listening on localPort, else the first one
++    const AnyP::PortCfg *listener = HttpPortList.getRaw();
++    for (const AnyP::PortCfg *p = listener; p; p = p->next.getRaw()) {
++        if (p->s.port() == localPort) {
++            listener = p;
++            break;
++        }
++    }
++    if (listener && listener->name)
++        request->myportname = listener->name;
++    if (DnsMode == 2)
++        request->flags.destinationIpLookedUp = true; // lookups here are final
++
++    AccessLogEntry::Pointer al = new AccessLogEntry;
++    al->request = request.getRaw();
++    HTTPMSGLOCK(al->request);
++    al->adapted_request = request.getRaw(); // no adaptation offline
++    HTTPMSGLOCK(al->adapted_request);
++    al->url = SBuf(r.url.c_str());
++    al->cache.caddr = request->client_addr;
++
++    if (r.hasTime)
++        UseLogTimezone(r.tzOffset);
++
++    // Pass 0 is the real check. Each later pass ignores all rules up to the
++    // previous winner, revealing the next matching rule, until none is left.
++    Skipped.clear();
++    allow_t firstAnswer;
++    const ACL *lastEvaluated = nullptr;
++    bool firstPassMatched = false;
++    std::string trace;
++    std::set<std::string> unsure; // only pass 0 decides the verdict
++    ACLChecklist::SkipRulesThrough = -1;
++    for (size_t pass = 0; pass <= run.rules.size(); ++pass) {
++        Steps.clear();
++        ACLFilledChecklist checklist(tree, request.getRaw(), nullptr);
++        checklist.al = al;
++        if (DnsMode == 2) {
++            checklist.markDestinationDomainChecked();
++            checklist.markSourceDomainChecked();
++        }
++        // every logged debug message resets the clock (getCurrentTime()),
++        // so restore the logged time right before "acl time" may read it
++        if (r.hasTime) {
++            squid_curtime = r.when;
++            current_time.tv_sec = r.when;
++            current_time.tv_usec = 0;
++            current_dtime = r.when;
++        }
++        const allow_t answer = checklist.fastCheck();
++
++        const ACL *winner = nullptr;
++        for (const auto &step : Steps) {
++            if (step.parent != tree)
++                continue;
++            if (pass == 0)
++                lastEvaluated = step.node;
++            if (step.result)
++                winner = step.node;
++        }
++        if (pass == 0) {
++            firstAnswer = answer;
++            firstPassMatched = winner;
++            trace = FormatTrace(tree);
++            unsure = Skipped;
++            if (!answer.allowed() && !answer.denied()) {
++                // AUTH or DUNNO: the last ACL checked in that rule ended the check
++                const ACL *culprit = lastEvaluated;
++                for (const auto &step : Steps) {
++                    if (lastEvaluated && step.parent == lastEvaluated)
++                        culprit = step.node;
++                }
++                unsure.insert(culprit ? culprit->name : "?");
++            }
++        }
++        if (!winner)
++            break;
++
++        RuleMatch m;
++        m.name = winner->name;
++        m.action = answer.allowed() ? "allow" : (answer.denied() ? "deny" : "?");
++        m.text = winner->cfgline ? winner->cfgline : "";
++        d.matches.push_back(m);
++        if (m.action == "?")
++            break; // exceptional answers (e.g., AUTH) end the check
++
++        ACLChecklist::SkipRulesThrough = RulePosition(m.name);
++        if (ACLChecklist::SkipRulesThrough < 0)
++            break;
++    }
++    ACLChecklist::SkipRulesThrough = -1;
++
++    d.verdict = VerdictName(firstAnswer);
++    if (firstPassMatched) {
++        d.rule = d.matches[0].name;
++        d.ruleText = d.matches[0].text;
++    } else if (!firstAnswer.allowed() && !firstAnswer.denied() && lastEvaluated) {
++        // an exceptional answer while this rule was being checked
++        d.rule = lastEvaluated->name;
++        d.ruleText = lastEvaluated->cfgline ? lastEvaluated->cfgline : "";
++    } else {
++        d.rule = "implicit";
++        d.ruleText = "(no rule matched: opposite of the last rule's action)";
++    }
++
++    for (const auto &name : unsure)
++        d.unsure += (d.unsure.empty() ? "" : " ") + name;
++
++    if (current) {
++        const char *logged = LoggedVerdict(r);
++        if (!d.unsure.empty())
++            d.vsLog = "UNSURE";
++        else if (*logged)
++            d.vsLog = d.verdict == logged ? "same" : "DIFF";
++    }
++
++    // keep one trace per report group; all of them for --sim-trace
++    const std::string key = r.clientIp + "\x1f" + r.method + "\x1f" + r.host + "\x1f" + d.verdict + "\x1f" + d.rule;
++    const bool firstOfGroup = run.traceAt.find(key) == run.traceAt.end();
++    if (ShowTrace || (ReportFile && firstOfGroup))
++        d.trace = trace;
++    if (ReportFile && firstOfGroup)
++        run.traceAt[key] = run.decisions.size();
++    return d;
++}
++
++/* --optimize */
++
++static void
++AddFinding(ConfigRun &run, const int severity, const char *category, const std::string &subject,
++           const std::string &where, const std::string &message, const std::string &fix)
++{
++    Finding f;
++    f.severity = severity;
++    f.category = category;
++    f.subject = subject;
++    f.where = where;
++    f.message = message;
++    f.fix = fix;
++    run.findings.push_back(f);
++}
++
++static std::string
++JoinDump(const ACL *acl)
++{
++    std::string values;
++    for (const auto &item : acl->dump()) {
++        if (!values.empty())
++            values += " ";
++        values += item.toStdString();
++    }
++    return values;
++}
++
++/// names of ACLs that match every request
++static std::set<std::string>
++UniversalAcls()
++{
++    std::set<std::string> names;
++    names.insert("all");
++    // other regex types (browser, req_header, ...) mismatch when their field is absent
++    for (const auto &note : Acl::ConfigNotes) {
++        if (note.kind == "universal" && (note.type == "url_regex" || note.type == "urlpath_regex"))
++            names.insert(note.acl);
++    }
++    // "dst all" still needs a DNS answer, so only "src" is universal
++    static const std::set<std::string> anyAddress = { "all", "0.0.0.0/0", "::/0", "[::]/0" };
++    for (const ACL *a = Config.aclList; a; a = a->next) {
++        if (strcmp(a->typeString(), "src") != 0)
++            continue;
++        for (const auto &item : a->dump()) {
++            if (anyAddress.count(item.toStdString()))
++                names.insert(a->name);
++        }
++    }
++    return names;
++}
++
++/// finds unneeded or ineffective ACLs and http_access rules in the parsed squid.conf
++static void
++Analyze(ConfigRun &run)
++{
++    // what the ACL parsers noticed
++    for (const auto &note : Acl::ConfigNotes) {
++        if (note.kind == "predefined")
++            AddFinding(run, 2, "built-in ACL redefined", note.acl, note.where + "  " + note.line, note.message,
++                       "delete this acl line; Squid already defines '" + note.acl + "'");
++        else if (note.kind == "covered")
++            AddFinding(run, 1, "covered by a wider entry", note.acl, note.where + "  " + note.line, note.message,
++                       "delete the narrower entry");
++        else if (note.kind == "duplicate")
++            AddFinding(run, 1, "duplicate entry", note.acl, note.where + "  " + note.line, note.message,
++                       "delete the repeated entry");
++        else if (note.kind == "universal")
++            AddFinding(run, 2, "matches everything", note.acl, note.where + "  " + note.line, note.message,
++                       "use the built-in 'all' ACL or remove the pattern");
++    }
++
++    // unused and identical ACL definitions
++    std::map<std::string, std::vector<std::string> > bySignature;
++    for (ACL *a = Config.aclList; a; a = a->next) {
++        if (Acl::PredefinedAcls.count(a->name))
++            continue;
++        if (!Acl::AclReferences.count(Lower(a->name)))
++            AddFinding(run, 1, "unused ACL", a->name, a->cfgline ? a->cfgline : "",
++                       "defined, but no directive or other ACL uses it", "delete its acl line(s)");
++        std::string options;
++        for (const auto &option : a->dumpOptions())
++            options += option.toStdString() + " ";
++        bySignature[std::string(a->typeString()) + " " + options + JoinDump(a)].push_back(a->name);
++    }
++    for (const auto &entry : bySignature) {
++        if (entry.second.size() < 2)
++            continue;
++        std::string names;
++        for (const auto &name : entry.second)
++            names += (names.empty() ? "" : ", ") + name;
++        AddFinding(run, 1, "identical ACLs", names, entry.first,
++                   "these ACLs have the same type and values", "keep one of them and use its name everywhere");
++    }
++
++    // http_access rules
++    const std::set<std::string> universal = UniversalAcls();
++    const size_t count = run.rules.size();
++    std::vector<std::set<std::string> > conditions(count);
++    std::vector<bool> impossible(count, false), reported(count, false);
++    for (size_t j = 0; j < count; ++j) {
++        const RuleInfo &rule = run.rules[j];
++        std::set<std::string> seen;
++        for (const auto &acl : rule.acls) {
++            const bool negated = acl[0] == '!';
++            const std::string base = negated ? acl.substr(1) : acl;
++            if (!seen.insert(acl).second)
++                AddFinding(run, 1, "repeated ACL in rule", rule.name, rule.text,
++                           "'" + acl + "' appears twice", "remove the repetition");
++            if (seen.count(negated ? base : "!" + base)) {
++                impossible[j] = true;
++                AddFinding(run, 3, "rule never matches", rule.name, rule.text,
++                           "it requires both '" + base + "' and '!" + base + "'", "fix or delete the rule");
++            }
++            if (universal.count(base)) {
++                if (negated) {
++                    impossible[j] = true;
++                    AddFinding(run, 3, "rule never matches", rule.name, rule.text,
++                               "'!" + base + "' never matches because '" + base + "' matches everything",
++                               "fix or delete the rule");
++                } else if (rule.acls.size() > 1) {
++                    AddFinding(run, 1, "redundant 'all'", rule.name, rule.text,
++                               "'" + base + "' matches everything, so it adds no condition",
++                               "remove it, unless it is last on purpose to suppress an authentication challenge");
++                }
++                continue; // a universal ACL does not narrow the rule
++            }
++            conditions[j].insert(acl);
++        }
++    }
++
++    // a rule is dead when an earlier rule needs only a subset of its ACLs
++    bool unconditionalBefore = false; // an earlier rule matches every request
++    for (size_t j = 0; j < count; ++j) {
++        if (impossible[j])
++            continue;
++        const bool unconditional = conditions[j].empty();
++        const RuleInfo &rule = run.rules[j];
++        for (size_t i = 0; i < j; ++i) {
++            if (impossible[i] || !std::includes(conditions[j].begin(), conditions[j].end(),
++                                                conditions[i].begin(), conditions[i].end()))
++                continue;
++            const RuleInfo &earlier = run.rules[i];
++            reported[j] = true;
++            // the implicit default matters only if some request can reach it
++            const bool setsDefault = j + 1 == count && !unconditionalBefore &&
++                                     ImplicitVerdict(run, rule.name) != ImplicitVerdict(run);
++            if (earlier.action == rule.action && setsDefault)
++                AddFinding(run, 1, "redundant rule", rule.name, rule.text,
++                           "every request it matches is already matched by " + earlier.name + " [" + earlier.text +
++                           "] with the same action",
++                           "keep it anyway: as the last rule it makes unmatched requests " + ImplicitVerdict(run));
++            else if (earlier.action == rule.action)
++                AddFinding(run, 2, "redundant rule", rule.name, rule.text,
++                           "every request it matches is already matched by " + earlier.name + " [" + earlier.text +
++                           "] with the same action", "delete this rule");
++            else
++                AddFinding(run, 3, "unreachable rule", rule.name, rule.text,
++                           "every request it matches is decided first by " + earlier.name + " [" + earlier.text +
++                           "] with the opposite action", "move it above " + earlier.name + " or delete it");
++            break;
++        }
++        unconditionalBefore = unconditionalBefore || unconditional;
++    }
++
++    // what the replayed log shows
++    if (LogFile && !Records.empty()) {
++        for (size_t j = 0; j < count; ++j) {
++            if (impossible[j] || reported[j])
++                continue;
++            const RuleInfo &rule = run.rules[j];
++            if (!rule.decided && !rule.shadowed)
++                AddFinding(run, 1, "no logged request matches", rule.name, rule.text,
++                           "none of the " + std::to_string(Records.size()) + " logged requests match it",
++                           "check whether it is still needed");
++            else if (!rule.decided)
++                AddFinding(run, 2, "never decides in the log", rule.name, rule.text,
++                           "it matches " + std::to_string(rule.shadowed) +
++                           " logged requests, but an earlier rule always decides them first",
++                           "check the rule order or delete it");
++        }
++    }
++
++    std::stable_sort(run.findings.begin(), run.findings.end(), [](const Finding &x, const Finding &y) {
++        return x.severity > y.severity;
++    });
++}
++
++static const char *
++SeverityName(const int severity)
++{
++    return severity >= 3 ? "HIGH" : (severity == 2 ? "MEDIUM" : "LOW");
++}
++
++/* terminal output */
++
++static void
++PrintFindings(const char *label, const ConfigRun &run)
++{
++    std::cout << "\n# optimize " << label << "squid.conf: " << run.path << " (" << run.findings.size() << " findings)\n";
++    for (const auto &f : run.findings) {
++        const char *color = f.severity >= 3 ? "1;31" : (f.severity == 2 ? "1;33" : "36");
++        std::cout << "  " << Paint(Pad(SeverityName(f.severity), 6), color) << "  " << Pad(f.category, 27) <<
++                  "  " << f.subject << "\n" <<
++                  "          " << f.message << "\n";
++        if (!f.where.empty())
++            std::cout << "          at:  " << f.where << "\n";
++        std::cout << "          fix: " << f.fix << "\n";
++    }
++}
++
++static void
++PrintDecision(const Record &r, const Decision &d, const ConfigRun &run)
++{
++    char num[16];
++    snprintf(num, sizeof(num), "%7u", r.lineNo);
++    std::cout << num << "  " << Paint(Pad(d.verdict, 5), VerdictColor(d.verdict)) << "  " <<
++              Pad(d.rule, 16) << "  " << r.clientIp << "  " << r.method << " " << r.url;
++    if (!r.squidStatus.empty()) {
++        std::string vs = d.vsLog;
++        if (vs == "DIFF")
++            vs = Paint(vs, "1;35");
++        std::cout << "  (log " << r.squidStatus << "/" << r.status << ": " << vs << ")";
++    }
++    std::cout << "\n";
++    if (d.verdict == "SKIP") {
++        std::cout << "           " << d.ruleText << "\n";
++        return;
++    }
++    std::cout << "           decided by: " << d.ruleText << "\n";
++    std::cout << "           matching:   " << MatchChain(d);
++    if (d.rule != "implicit")
++        std::cout << "   | without " << Short(d.rule) << ": " << WithoutDecisive(d, run);
++    std::cout << "\n";
++    if (!d.unsure.empty())
++        std::cout << "           " << Paint("not evaluable offline: " + d.unsure, "33") << "\n";
++    if (ShowTrace)
++        std::cout << d.trace;
++}
++
++static bool
++Changed(const Decision &a, const Decision &b)
++{
++    // rule numbers shift when rules are added, so compare the rule text
++    return a.verdict != b.verdict || a.ruleText != b.ruleText;
++}
++
++static void
++PrintChanges()
++{
++    std::cout << "# requests whose result differs between\n#   current: " << Runs[0].path <<
++              "\n#   new:     " << Runs[1].path << "\n";
++    for (size_t i = 0; i < Records.size(); ++i) {
++        const Decision &a = Runs[0].decisions[i];
++        const Decision &b = Runs[1].decisions[i];
++        if (!Changed(a, b))
++            continue;
++        const Record &r = Records[i];
++        char num[16];
++        snprintf(num, sizeof(num), "%7u", r.lineNo);
++        const bool verdictChanged = a.verdict != b.verdict;
++        std::cout << num << "  " << Paint(Pad(a.verdict, 5), VerdictColor(a.verdict)) << " -> " <<
++                  Paint(Pad(b.verdict, 5), VerdictColor(b.verdict)) << "  " <<
++                  (verdictChanged ? Paint("VERDICT", "1;35") : std::string("rule   ")) << "  " <<
++                  r.clientIp << "  " << r.method << " " << r.url << "\n" <<
++                  "           current: " << Pad(Short(a.rule), 9) << a.ruleText << "\n" <<
++                  "           new:     " << Pad(Short(b.rule), 9) << b.ruleText << "\n";
++        if (ShowTrace)
++            std::cout << "           current trace:\n" << a.trace << "           new trace:\n" << b.trace;
++    }
++}
++
++static void
++PrintRunSummary(const char *label, const ConfigRun &run, const bool current)
++{
++    std::cout << "\n# " << label << " squid.conf: " << run.path << "\n" <<
++              "#   ALLOW " << run.allowed << "  DENY " << run.denied << "  other " << run.other <<
++              "  skipped " << run.skipped << "  not-evaluable-offline " << run.unsure;
++    if (current)
++        std::cout << "  differs-from-log " << run.differ;
++    std::cout << "\n#   decided  also-matched  rule\n";
++    for (const auto &rule : run.rules) {
++        char counts[64];
++        snprintf(counts, sizeof(counts), "%9u  %12u  ", rule.decided, rule.shadowed);
++        std::cout << "# " << counts << Pad(Short(rule.name), 5) << " " << rule.text <<
++                  (rule.decided ? "" : "   <- never decides") << "\n";
++    }
++    char counts[64];
++    snprintf(counts, sizeof(counts), "%9u  %12s  ", run.implicitHits, "-");
++    std::cout << "# " << counts << "implicit " << ImplicitVerdict(run) << "\n";
++}
++
++static void
++PrintCompareSummary()
++{
++    std::map<std::string, unsigned> transitions;
++    unsigned verdictChanges = 0, ruleChanges = 0;
++    for (size_t i = 0; i < Records.size(); ++i) {
++        const Decision &a = Runs[0].decisions[i];
++        const Decision &b = Runs[1].decisions[i];
++        if (!Changed(a, b))
++            continue;
++        if (a.verdict != b.verdict)
++            ++verdictChanges;
++        else
++            ++ruleChanges;
++        ++transitions[a.verdict + " " + Short(a.rule) + " -> " + b.verdict + " " + Short(b.rule)];
++    }
++    std::vector<std::pair<std::string, unsigned> > sorted(transitions.begin(), transitions.end());
++    std::sort(sorted.begin(), sorted.end(), [](const std::pair<std::string, unsigned> &x, const std::pair<std::string, unsigned> &y) {
++        return x.second > y.second;
++    });
++    std::cout << "\n# changes: " << verdictChanges << " verdict changes, " << ruleChanges <<
++              " deciding-rule changes (same verdict)\n";
++    for (const auto &t : sorted)
++        std::cout << "# " << Pad(std::to_string(t.second), 9) << " " << t.first << "\n";
++}
++
++/* HTML report */
++
++static std::string
++Esc(const std::string &s)
++{
++    std::string out;
++    out.reserve(s.size());
++    for (const char c : s) {
++        switch (c) {
++        case '&':
++            out += "&amp;";
++            break;
++        case '<':
++            out += "&lt;";
++            break;
++        case '>':
++            out += "&gt;";
++            break;
++        case '"':
++            out += "&quot;";
++            break;
++        default:
++            out += c;
++        }
++    }
++    return out;
++}
++
++static std::string
++Pill(const std::string &verdict)
++{
++    return "<span class=\"pill " + Lower(verdict) + "\">" + Esc(verdict) + "</span>";
++}
++
++typedef std::vector<std::pair<std::string, unsigned> > Counts;
++
++static Counts
++Top(const std::map<std::string, unsigned> &counts, const size_t limit)
++{
++    Counts result(counts.begin(), counts.end());
++    std::sort(result.begin(), result.end(), [](const std::pair<std::string, unsigned> &x, const std::pair<std::string, unsigned> &y) {
++        return x.second > y.second || (x.second == y.second && x.first < y.first);
++    });
++    if (result.size() > limit)
++        result.resize(limit);
++    return result;
++}
++
++static void
++ReportCard(std::ostream &out, const char *label, const unsigned value, const char *cls)
++{
++    out << "<div class=\"card " << cls << "\"><div class=\"label\">" << label <<
++        "</div><div class=\"value\">" << value << "</div></div>";
++}
++
++static void
++ReportRules(std::ostream &out, const ConfigRun &run, const std::set<std::string> &otherTexts, const bool compare)
++{
++    unsigned most = 1;
++    for (const auto &rule : run.rules)
++        most = std::max(most, rule.decided);
++    most = std::max(most, run.implicitHits);
++
++    out << "<table class=\"rules\"><thead><tr><th>#</th><th>action</th><th>rule</th>"
++        "<th class=\"num\">decided</th><th class=\"barcol\"></th><th class=\"num\">also matched</th></tr></thead><tbody>";
++    for (const auto &rule : run.rules) {
++        const bool unique = compare && !otherTexts.count(rule.text);
++        out << "<tr" << (rule.decided ? "" : " class=\"unused\"") << "><td>" << Esc(Short(rule.name)) <<
++            "</td><td>" << Pill(rule.action == "allow" ? "ALLOW" : "DENY") << "</td><td class=\"mono\">" <<
++            Esc(rule.text) << (unique ? " <span class=\"tag\">only here</span>" : "") <<
++            (rule.decided ? "" : " <span class=\"tag muted\">never decides</span>") <<
++            "</td><td class=\"num\">" << rule.decided << "</td><td class=\"barcol\"><div class=\"bar " << rule.action <<
++            "\"><span style=\"width:" << (100.0 * rule.decided / most) << "%\"></span></div></td><td class=\"num\">" <<
++            rule.shadowed << "</td></tr>";
++    }
++    out << "<tr><td>-</td><td>" << Pill(ImplicitVerdict(run)) << "</td><td class=\"mono\">implicit (no rule matched)</td>"
++        "<td class=\"num\">" << run.implicitHits << "</td><td class=\"barcol\"><div class=\"bar\"><span style=\"width:" <<
++        (100.0 * run.implicitHits / most) << "%\"></span></div></td><td class=\"num\">-</td></tr></tbody></table>";
++}
++
++/// for every rule that denied something: what, who, and what would allow it
++static void
++ReportDenials(std::ostream &out, const ConfigRun &run)
++{
++    class DenyInfo
++    {
++    public:
++        unsigned count = 0;
++        std::string text;
++        std::map<std::string, unsigned> hosts, clients, alternatives;
++    };
++    std::map<std::string, DenyInfo> byRule;
++    for (size_t i = 0; i < Records.size(); ++i) {
++        const Decision &d = run.decisions[i];
++        if (d.verdict != "DENY")
++            continue;
++        DenyInfo &info = byRule[d.rule];
++        ++info.count;
++        info.text = d.ruleText;
++        ++info.hosts[Records[i].host];
++        ++info.clients[Records[i].clientIp];
++        const std::string allow = FirstMatching(d, "allow");
++        ++info.alternatives[allow.empty() ? "no allow rule matches" : "allowed by " + allow];
++    }
++    if (byRule.empty()) {
++        out << "<p class=\"muted\">No request is denied.</p>";
++        return;
++    }
++
++    std::vector<std::pair<std::string, const DenyInfo *> > sorted;
++    for (const auto &entry : byRule)
++        sorted.push_back(std::make_pair(entry.first, &entry.second));
++    std::sort(sorted.begin(), sorted.end(), [](const std::pair<std::string, const DenyInfo *> &x, const std::pair<std::string, const DenyInfo *> &y) {
++        return x.second->count > y.second->count;
++    });
++
++    for (const auto &entry : sorted) {
++        const DenyInfo &info = *entry.second;
++        out << "<div class=\"deny\"><div class=\"denyhead\">" << Pill("DENY") << " <b>" << Esc(entry.first) <<
++            "</b> <span class=\"mono\">" << Esc(info.text) << "</span><span class=\"count\">" << info.count <<
++            " requests</span></div><div class=\"cols\">";
++        const char *titles[] = { "Top destinations", "Top clients", "Next matching allow rule" };
++        const std::map<std::string, unsigned> *maps[] = { &info.hosts, &info.clients, &info.alternatives };
++        for (int k = 0; k < 3; ++k) {
++            out << "<div><h4>" << titles[k] << "</h4><ol>";
++            for (const auto &item : Top(*maps[k], 10))
++                out << "<li><span class=\"mono\">" << Esc(item.first) << "</span> <span class=\"muted\">" << item.second << "</span></li>";
++            out << "</ol></div>";
++        }
++        out << "</div></div>";
++    }
++}
++
++static std::string
++TraceOf(const ConfigRun &run, const Record &r, const Decision &d)
++{
++    const auto it = run.traceAt.find(r.clientIp + "\x1f" + r.method + "\x1f" + r.host + "\x1f" + d.verdict + "\x1f" + d.rule);
++    return it == run.traceAt.end() ? std::string() : run.decisions[it->second].trace;
++}
++
++/// distinct (client, method, destination, outcome) groups
++static void
++ReportRequests(std::ostream &out, const bool compare)
++{
++    class Group
++    {
++    public:
++        unsigned count = 0;
++        size_t first = 0;
++    };
++    std::map<std::string, Group> groups;
++    for (size_t i = 0; i < Records.size(); ++i) {
++        const Record &r = Records[i];
++        const Decision &a = Runs[0].decisions[i];
++        std::string key = r.clientIp + "\x1f" + r.method + "\x1f" + r.host + "\x1f" + a.verdict + "\x1f" + a.rule;
++        if (compare)
++            key += "\x1f" + Runs[1].decisions[i].verdict + "\x1f" + Runs[1].decisions[i].rule;
++        Group &g = groups[key];
++        if (!g.count++)
++            g.first = i;
++    }
++    std::vector<const Group *> sorted;
++    for (const auto &entry : groups)
++        sorted.push_back(&entry.second);
++    std::sort(sorted.begin(), sorted.end(), [](const Group *x, const Group *y) {
++        return x->count > y->count || (x->count == y->count && x->first < y->first);
++    });
++
++    out << "<div class=\"filters\"><input id=\"req-q\" type=\"search\" placeholder=\"Filter: client, host, rule...\" oninput=\"applyFilter('req')\">"
++        "<select id=\"req-v\" onchange=\"applyFilter('req')\"><option value=\"\">all verdicts</option>"
++        "<option>ALLOW</option><option>DENY</option><option>AUTH</option><option>DUNNO</option><option>SKIP</option></select>";
++    if (compare)
++        out << "<label><input id=\"req-c\" type=\"checkbox\" onchange=\"applyFilter('req')\"" <<
++            " checked> changed only</label>";
++    out << "</div>";
++    if (sorted.size() > ReportRowLimit)
++        out << "<p class=\"muted\">Showing the " << ReportRowLimit << " largest of " << sorted.size() << " groups.</p>";
++
++    out << "<table id=\"req\" class=\"requests\"><thead><tr><th class=\"num\">count</th><th>client</th><th>method</th>"
++        "<th>destination</th><th>" << (compare ? "current" : "verdict") << "</th><th>decided by</th><th>matching rules</th>";
++    if (compare)
++        out << "<th>new</th><th>decided by (new)</th>";
++    out << "<th>first line</th></tr></thead><tbody>";
++
++    size_t shown = 0;
++    for (const Group *g : sorted) {
++        if (++shown > ReportRowLimit)
++            break;
++        const Record &r = Records[g->first];
++        const Decision &a = Runs[0].decisions[g->first];
++        const bool changed = compare && Changed(a, Runs[1].decisions[g->first]);
++        out << "<tr data-verdict=\"" << Esc(a.verdict) << "\" data-changed=\"" << (changed ? 1 : 0) << "\"" <<
++            (changed ? " class=\"changed\"" : "") << "><td class=\"num\">" << g->count << "</td><td class=\"mono\">" <<
++            Esc(r.clientIp) << "</td><td>" << Esc(r.method) << "</td><td class=\"mono\">" << Esc(r.host) <<
++            "</td><td>" << Pill(a.verdict) << "</td><td><details><summary>" << Esc(Short(a.rule)) <<
++            "</summary><div class=\"mono small\">" << Esc(a.ruleText) << "</div><pre>" << Esc(TraceOf(Runs[0], r, a)) <<
++            "</pre></details></td><td class=\"mono small\">" << Esc(MatchChain(a)) << "</td>";
++        if (compare) {
++            const Decision &b = Runs[1].decisions[g->first];
++            out << "<td>" << Pill(b.verdict) << "</td><td><details><summary>" << Esc(Short(b.rule)) <<
++                "</summary><div class=\"mono small\">" << Esc(b.ruleText) << "</div><pre>" << Esc(TraceOf(Runs[1], r, b)) <<
++                "</pre></details></td>";
++        }
++        out << "<td class=\"num\">" << r.lineNo << "</td></tr>";
++    }
++    out << "</tbody></table>";
++}
++
++static void
++ReportTransitions(std::ostream &out)
++{
++    std::map<std::string, unsigned> counts;
++    std::map<std::string, size_t> example;
++    for (size_t i = 0; i < Records.size(); ++i) {
++        const Decision &a = Runs[0].decisions[i];
++        const Decision &b = Runs[1].decisions[i];
++        if (!Changed(a, b))
++            continue;
++        const std::string key = a.verdict + "\x1f" + a.rule + "\x1f" + b.verdict + "\x1f" + b.rule;
++        if (!counts[key]++)
++            example[key] = i;
++    }
++    if (counts.empty()) {
++        out << "<p class=\"muted\">No request changes its verdict or deciding rule.</p>";
++        return;
++    }
++    out << "<table class=\"requests\"><thead><tr><th class=\"num\">requests</th><th>current</th><th>rule</th>"
++        "<th></th><th>new</th><th>rule</th><th>example</th></tr></thead><tbody>";
++    for (const auto &t : Top(counts, ReportRowLimit)) {
++        const size_t i = example[t.first];
++        const Decision &a = Runs[0].decisions[i];
++        const Decision &b = Runs[1].decisions[i];
++        out << "<tr" << (a.verdict != b.verdict ? " class=\"changed\"" : "") << "><td class=\"num\">" << t.second <<
++            "</td><td>" << Pill(a.verdict) << "</td><td class=\"mono small\"><b>" << Esc(Short(a.rule)) << "</b> " <<
++            Esc(a.ruleText) << "</td><td>&rarr;</td><td>" << Pill(b.verdict) << "</td><td class=\"mono small\"><b>" <<
++            Esc(Short(b.rule)) << "</b> " << Esc(b.ruleText) << "</td><td class=\"mono small\">" <<
++            Esc(Records[i].clientIp + " " + Records[i].method + " " + Records[i].url) << "</td></tr>";
++    }
++    out << "</tbody></table>";
++}
++
++static void
++ReportLogDifferences(std::ostream &out)
++{
++    std::map<std::string, unsigned> counts;
++    std::map<std::string, size_t> example;
++    for (size_t i = 0; i < Records.size(); ++i) {
++        const Decision &d = Runs[0].decisions[i];
++        if (d.vsLog != "DIFF")
++            continue;
++        const Record &r = Records[i];
++        const std::string key = r.clientIp + "\x1f" + r.host + "\x1f" + r.squidStatus + "\x1f" + d.verdict + "\x1f" + d.rule;
++        if (!counts[key]++)
++            example[key] = i;
++    }
++    if (counts.empty()) {
++        out << "<p class=\"muted\">Every evaluable request matches what access.log recorded.</p>";
++        return;
++    }
++    out << "<p class=\"muted\">TCP_DENIED can also come from directives other than http_access "
++        "(miss_access, adapted_http_access, ssl_bump, ...) or from a config that changed after logging.</p>"
++        "<table class=\"requests\"><thead><tr><th class=\"num\">requests</th><th>client</th><th>destination</th>"
++        "<th>logged</th><th>simulated</th><th>decided by</th></tr></thead><tbody>";
++    for (const auto &t : Top(counts, ReportRowLimit)) {
++        const size_t i = example[t.first];
++        const Record &r = Records[i];
++        const Decision &d = Runs[0].decisions[i];
++        out << "<tr><td class=\"num\">" << t.second << "</td><td class=\"mono\">" << Esc(r.clientIp) <<
++            "</td><td class=\"mono\">" << Esc(r.host) << "</td><td class=\"mono\">" << Esc(r.squidStatus + "/" + r.status) <<
++            "</td><td>" << Pill(d.verdict) << "</td><td class=\"mono small\"><b>" << Esc(Short(d.rule)) << "</b> " <<
++            Esc(d.ruleText) << "</td></tr>";
++    }
++    out << "</tbody></table>";
++}
++
++static void
++ReportFindings(std::ostream &out, const ConfigRun &run)
++{
++    if (run.findings.empty()) {
++        out << "<p class=\"muted\">Nothing to optimize.</p>";
++        return;
++    }
++    out << "<table class=\"requests\"><thead><tr><th>severity</th><th>finding</th><th>subject</th>"
++        "<th>details</th><th>suggestion</th></tr></thead><tbody>";
++    for (const auto &f : run.findings) {
++        out << "<tr><td>" << Pill(SeverityName(f.severity)) << "</td><td>" << Esc(f.category) <<
++            "</td><td class=\"mono\">" << Esc(f.subject) << "</td><td>" << Esc(f.message);
++        if (!f.where.empty())
++            out << "<div class=\"mono small muted\">" << Esc(f.where) << "</div>";
++        out << "</td><td>" << Esc(f.fix) << "</td></tr>";
++    }
++    out << "</tbody></table>";
++}
++
++static bool
++WriteReport()
++{
++    std::ofstream out(ReportFile);
++    if (!out) {
++        std::cerr << "squid --simulate: cannot write " << ReportFile << std::endl;
++        return false;
++    }
++    const bool compare = CompareConf != nullptr;
++    const ConfigRun &cur = Runs[0];
++
++    std::set<std::string> texts[2];
++    for (int k = 0; k < (compare ? 2 : 1); ++k) {
++        for (const auto &rule : Runs[k].rules)
++            texts[k].insert(rule.text);
++    }
++
++    unsigned verdictChanges = 0, nowDenied = 0, nowAllowed = 0, ruleChanges = 0;
++    if (compare) {
++        for (size_t i = 0; i < Records.size(); ++i) {
++            const Decision &a = Runs[0].decisions[i];
++            const Decision &b = Runs[1].decisions[i];
++            if (!Changed(a, b))
++                continue;
++            if (a.verdict == b.verdict) {
++                ++ruleChanges;
++                continue;
++            }
++            ++verdictChanges;
++            if (b.verdict == "DENY")
++                ++nowDenied;
++            if (b.verdict == "ALLOW")
++                ++nowAllowed;
++        }
++    }
++
++    const time_t now = time(nullptr);
++    char stamp[64];
++    strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S UTC", gmtime(&now));
++
++    out << "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
++        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
++        "<title>Squid ACL Simulation</title><style>"
++        ":root{--bg:#f7f7f5;--panel:#fff;--text:#1d1d1b;--muted:#6b6b66;--line:#e3e2dc;--allow:#1a7f4b;--allow-bg:#e3f4ea;"
++        "--deny:#c0362c;--deny-bg:#fbe6e3;--warn:#9a6700;--warn-bg:#fff4d6;--accent:#3b5bdb;--changed:#fff8e1}"
++        "@media (prefers-color-scheme:dark){:root{--bg:#161615;--panel:#1f1f1d;--text:#ecebe6;--muted:#9c9b95;--line:#33332f;"
++        "--allow:#5fd08f;--allow-bg:#163322;--deny:#ff7b6e;--deny-bg:#3a1a17;--warn:#e8b949;--warn-bg:#3a2e10;--accent:#8ea2ff;--changed:#2c2817}}"
++        "*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,'Segoe UI','Noto Sans KR',sans-serif}"
++        "main{max-width:1280px;margin:0 auto;padding:24px 16px 64px}h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:32px 0 12px}"
++        "h4{margin:0 0 6px;font-size:13px;color:var(--muted);font-weight:600}.muted{color:var(--muted)}.mono{font-family:ui-monospace,Menlo,Consolas,monospace}"
++        ".small{font-size:12px}.meta{color:var(--muted);font-size:13px}.meta code{color:var(--text)}"
++        ".cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:16px}"
++        ".card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}.card .label{font-size:12px;color:var(--muted)}"
++        ".card .value{font-size:24px;font-weight:650}.card.allow .value{color:var(--allow)}.card.deny .value{color:var(--deny)}.card.warn .value{color:var(--warn)}"
++        ".panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:4px 0;overflow-x:auto}"
++        "table{border-collapse:collapse;width:100%}th,td{padding:7px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}"
++        "th{font-size:12px;color:var(--muted);font-weight:600;white-space:nowrap}tbody tr:last-child td{border-bottom:0}.num{text-align:right;font-variant-numeric:tabular-nums}"
++        "tr.unused td{opacity:.55}tr.changed td{background:var(--changed)}"
++        ".pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.03em}"
++        ".pill.allow{background:var(--allow-bg);color:var(--allow)}.pill.deny{background:var(--deny-bg);color:var(--deny)}"
++        ".pill.auth,.pill.dunno,.pill.skip,.pill.medium{background:var(--warn-bg);color:var(--warn)}"
++        ".pill.high{background:var(--deny-bg);color:var(--deny)}.pill.low{background:var(--line);color:var(--muted)}"
++        ".tag{font-size:11px;border:1px solid var(--accent);color:var(--accent);border-radius:4px;padding:0 5px;margin-left:4px;font-family:system-ui}"
++        ".tag.muted{border-color:var(--line);color:var(--muted)}.barcol{width:22%}.bar{height:8px;background:var(--line);border-radius:4px;overflow:hidden;margin-top:6px}"
++        ".bar span{display:block;height:100%;background:var(--muted)}.bar.allow span{background:var(--allow)}.bar.deny span{background:var(--deny)}"
++        ".deny{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--deny);border-radius:10px;padding:12px 14px;margin-bottom:10px}"
++        ".denyhead{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline}.count{margin-left:auto;color:var(--muted)}"
++        ".cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin-top:10px}ol{margin:0;padding-left:20px}"
++        ".filters{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px;align-items:center}"
++        "input[type=search],select{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit}"
++        "input[type=search]{flex:1;min-width:200px}details summary{cursor:pointer;font-weight:600}"
++        "pre{margin:6px 0 0;font-size:11px;white-space:pre-wrap;color:var(--muted)}"
++        "</style></head><body><main>";
++
++    const bool replayed = LogFile != nullptr;
++    out << "<h1>Squid http_access simulation</h1><div class=\"meta\">";
++    if (replayed)
++        out << "log <code>" << Esc(LogFile) << "</code> &middot; ";
++    out << "current <code>" << Esc(cur.path) << "</code>";
++    if (compare)
++        out << " &middot; new <code>" << Esc(Runs[1].path) << "</code>";
++    out << " &middot; generated " << stamp << " &middot; DNS " << (DnsMode == 2 ? "system resolver" : "off (hosts_file only)") << "</div>";
++
++    out << "<div class=\"cards\">";
++    if (replayed) {
++        ReportCard(out, "requests", Records.size(), "");
++        ReportCard(out, "allowed", cur.allowed, "allow");
++        ReportCard(out, "denied", cur.denied, "deny");
++        ReportCard(out, "auth / other", cur.other, "warn");
++        ReportCard(out, "not evaluable offline", cur.unsure, "warn");
++        ReportCard(out, "differs from log", cur.differ, "warn");
++        ReportCard(out, "skipped lines", cur.skipped, "");
++    }
++    if (compare && replayed) {
++        ReportCard(out, "verdict changes", verdictChanges, "warn");
++        ReportCard(out, "newly denied", nowDenied, "deny");
++        ReportCard(out, "newly allowed", nowAllowed, "allow");
++        ReportCard(out, "rule-only changes", ruleChanges, "");
++    }
++    if (Optimize) {
++        ReportCard(out, "optimize findings", cur.findings.size(), "warn");
++        if (compare)
++            ReportCard(out, "optimize findings (new)", Runs[1].findings.size(), "warn");
++    }
++    out << "</div>";
++
++    if (Optimize) {
++        out << "<h2>Optimization" << (compare ? " &mdash; current squid.conf" : "") << "</h2><div class=\"panel\">";
++        ReportFindings(out, cur);
++        out << "</div>";
++        if (compare) {
++            out << "<h2>Optimization &mdash; new squid.conf</h2><div class=\"panel\">";
++            ReportFindings(out, Runs[1]);
++            out << "</div>";
++        }
++    }
++
++    if (compare && replayed) {
++        out << "<h2>Changes: current &rarr; new</h2><div class=\"panel\">";
++        ReportTransitions(out);
++        out << "</div>";
++    }
++
++    out << "<h2>Rules" << (compare ? " &mdash; current squid.conf" : "") << "</h2>"
++        "<p class=\"muted small\">decided: requests this rule decided. also matched: requests it matches although an earlier rule decided.</p>"
++        "<div class=\"panel\">";
++    ReportRules(out, cur, texts[1], compare);
++    out << "</div>";
++    if (compare) {
++        out << "<h2>Rules &mdash; new squid.conf</h2><div class=\"panel\">";
++        ReportRules(out, Runs[1], texts[0], compare);
++        out << "</div>";
++    }
++
++    if (replayed) {
++        out << "<h2>Denied requests by rule" << (compare ? " &mdash; current" : "") << "</h2>";
++        ReportDenials(out, cur);
++        if (compare) {
++            out << "<h2>Denied requests by rule &mdash; new</h2>";
++            ReportDenials(out, Runs[1]);
++        }
++
++        out << "<h2>Requests</h2><p class=\"muted small\">Grouped by client, method, destination and outcome. "
++            "Click a rule to see how every rule was evaluated.</p>";
++        ReportRequests(out, compare);
++
++        out << "<h2>Simulation vs. access.log</h2><div class=\"panel\">";
++        ReportLogDifferences(out);
++        out << "</div>";
++    }
++
++    out << "<script>function applyFilter(id){var t=document.getElementById(id);if(!t)return;"
++        "var q=(document.getElementById(id+'-q').value||'').toLowerCase();var v=document.getElementById(id+'-v').value;"
++        "var c=document.getElementById(id+'-c');var rows=t.tBodies[0].rows;for(var i=0;i<rows.length;i++){var r=rows[i];"
++        "var ok=!q||r.textContent.toLowerCase().indexOf(q)>=0;if(ok&&v)ok=r.getAttribute('data-verdict')===v;"
++        "if(ok&&c&&c.checked)ok=r.getAttribute('data-changed')==='1';r.style.display=ok?'':'none';}}"
++        "applyFilter('req');</script></main></body></html>\n";
++    if (!out) {
++        std::cerr << "squid --simulate: error while writing " << ReportFile << std::endl;
++        return false;
++    }
++    return true;
++}
++
++/* driver */
++
++static bool
++ReadLog()
++{
++    std::ifstream file;
++    std::istream *in = &std::cin;
++    if (strcmp(LogFile, "-") != 0) {
++        file.open(LogFile);
++        if (!file) {
++            std::cerr << "squid --simulate: cannot open " << LogFile << std::endl;
++            return false;
++        }
++        in = &file;
++    }
++
++    std::string line;
++    unsigned lineNo = 0;
++    while (std::getline(*in, line)) {
++        ++lineNo;
++        if (!line.empty() && line.back() == '\r')
++            line.pop_back();
++        if (line.empty() || line[0] == '#')
++            continue;
++        Record r;
++        r.lineNo = lineNo;
++        r.parsed = ParseLine(line, r);
++        Records.push_back(r);
++    }
++    return true;
++}
++
++/// replays all records through the currently parsed squid.conf
++static bool
++RunConfig(ConfigRun &run, const bool current, const bool printEach)
++{
++    Acl::Tree *tree = Config.accessList.http;
++    if (!tree) {
++        std::cerr << "squid --simulate: " << run.path << " has no http_access rules" << std::endl;
++        return false;
++    }
++
++    parseEtcHosts(); // hosts_file entries resolve even with --sim-dns off
++    // no live connections to count: "acl maxconn" never matches offline
++    Config.onoff.client_db = 0;
++    const int localPort = LocalPortOption >= 0 ? LocalPortOption :
++                          (HttpPortList != nullptr ? HttpPortList->s.port() : CACHE_HTTP_PORT);
++
++    run.rules = CollectRules(tree);
++    run.decisions.reserve(Records.size());
++    for (auto &r : Records) {
++        run.decisions.push_back(Evaluate(r, run, current, localPort));
++        CountDecision(run, run.decisions.back());
++        if (printEach)
++            PrintDecision(r, run.decisions.back(), run);
++    }
++    return true;
++}
++
++/// runs the simulation and/or the optimizer; returns the process exit code
++static int
++Run()
++{
++    Color = isatty(STDOUT_FILENO);
++    if (LogFile && !ReadLog())
++        return 1;
++
++    ipcache_simulator_mode = DnsMode;
++    fqdncache_simulator_mode = DnsMode;
++    ipcache_init();
++    fqdncache_init();
++    ACLChecklist::Tracer = &Trace;
++
++    // per-request lines only when they are the main output
++    const bool printEach = LogFile && !CompareConf && (!ReportFile || ShowTrace);
++
++    Runs[0].path = ConfigFile;
++    if (!RunConfig(Runs[0], true, printEach))
++        return 1;
++    if (Optimize)
++        Analyze(Runs[0]); // before another squid.conf replaces the parsed one
++
++    if (CompareConf) {
++        Runs[1].path = CompareConf;
++        Acl::ClearConfigNotes();
++        if (parseConfigFile(CompareConf) != 0) {
++            std::cerr << "squid --simulate: errors in " << CompareConf << std::endl;
++            return 1;
++        }
++        if (!RunConfig(Runs[1], false, false))
++            return 1;
++        if (Optimize)
++            Analyze(Runs[1]);
++        if (LogFile)
++            PrintChanges();
++    }
++
++    ACLChecklist::Tracer = nullptr;
++    if (LogFile) {
++        PrintRunSummary(CompareConf ? "current" : "", Runs[0], true);
++        if (CompareConf) {
++            PrintRunSummary("new", Runs[1], false);
++            PrintCompareSummary();
++        }
++    }
++    if (Optimize) {
++        PrintFindings(CompareConf ? "current " : "", Runs[0]);
++        if (CompareConf)
++            PrintFindings("new ", Runs[1]);
++    }
++
++    if (ReportFile) {
++        if (!WriteReport())
++            return 1;
++        std::cout << "\n# report written to " << ReportFile << "\n";
++    }
++    return 0;
++}
++
++} // namespace AclSimulator
++
++#endif /* SQUID_ACLSIMULATOR_H */
++
+--- a/src/cache_cf.cc
++++ b/src/cache_cf.cc
+@@ -3918,8 +3918,9 @@
+     if (stat(path, &sb) < 0) {
+         int xerrno = errno;
+         debugs(0, DBG_CRITICAL, (opt_parse_cfg_only?"FATAL: ":"ERROR: ") << name << " " << path << ": " << xstrerr(xerrno));
+-        // keep going to find more issues if we are only checking the config file with "-k parse"
+-        if (opt_parse_cfg_only)
++        // keep going to find more issues if we are only checking the config file with "-k parse",
++        // or replaying a log offline (squid --simulate/--optimize), which never opens these files
++        if (opt_parse_cfg_only || opt_simulate)
+             return;
+         // this is fatal if it is found during startup or reconfigure
+         if (opt_send_signal == -1 || opt_send_signal == SIGHUP)
+--- a/src/external_acl.cc
++++ b/src/external_acl.cc
+@@ -646,6 +646,10 @@
+             return ACCESS_DUNNO;
+         }
+ 
++        // not initialized when squid --simulate replays a log without helpers
++        if (!acl->def->cache || !acl->def->theHelper)
++            return ACCESS_DUNNO;
++
+         entry = static_cast<ExternalACLEntry *>(hash_lookup(acl->def->cache, key));
+ 
+         const ExternalACLEntryPointer staleEntry = entry;
+--- a/src/fqdncache.cc
++++ b/src/fqdncache.cc
+@@ -20,12 +20,16 @@
+ #include "SquidConfig.h"
+ #include "SquidTime.h"
+ #include "StatCounters.h"
++#include "sbuf/List.h"
+ #include "Store.h"
+ #include "util.h"
+ 
+ #if SQUID_SNMP
+ #include "snmp_core.h"
+ #endif
++
++#include <set>
++#include <string>
+ 
+ /**
+  \defgroup FQDNCacheAPI FQDN Cache API
+@@ -129,6 +133,9 @@
+ static void fqdncacheUnlockEntry(fqdncache_entry * f);
+ static FREE fqdncacheFreeEntry;
+ static void fqdncacheAddEntry(fqdncache_entry * f);
++static const char *fqdncacheSimulatorLookup(const Ip::Address &addr, char *name);
++
++int fqdncache_simulator_mode = 0;
+ 
+ /// \ingroup FQDNCacheInternal
+ static hash_table *fqdn_table = NULL;
+@@ -511,6 +518,9 @@
+ 
+     ++ FqdncacheStats.misses;
+ 
++    if (fqdncache_simulator_mode)
++        return (flags & FQDN_LOOKUP_IF_MISS) ? fqdncacheSimulatorLookup(addr, name) : NULL;
++
+     if (flags & FQDN_LOOKUP_IF_MISS) {
+         fqdncache_nbgethostbyaddr(addr, NULL, NULL);
+     }
+@@ -680,6 +690,36 @@
+     fqdncacheLockEntry(fce);
+ }
+ 
++/// ACL simulator replacement for async rDNS: resolves synchronously (mode 2)
++/// and caches the answer as a static entry, or gives up (mode 1)
++static const char *
++fqdncacheSimulatorLookup(const Ip::Address &addr, char *name)
++{
++    if (fqdncache_simulator_mode != 2)
++        return NULL;
++
++    static std::set<std::string> failed; // do not repeat blocking lookups that failed
++    if (failed.count(name))
++        return NULL;
++
++    struct addrinfo *ai = NULL;
++    addr.getAddrInfo(ai);
++    char host[1025]; // NI_MAXHOST
++    const int err = getnameinfo(ai->ai_addr, ai->ai_addrlen, host, sizeof(host), NULL, 0, NI_NAMEREQD);
++    Ip::Address::FreeAddr(ai);
++    if (err != 0) {
++        debugs(35, 3, "simulator: no rDNS for " << name);
++        failed.insert(name);
++        return NULL;
++    }
++
++    SBufList names;
++    names.push_back(SBuf(host));
++    fqdncacheAddEntryFromHosts(name, names);
++    const fqdncache_entry *f = fqdncache_get(name);
++    return f ? f->names[0] : NULL;
++}
++
+ /// \ingroup FQDNCacheInternal
+ static void
+ fqdncacheRegisterWithCacheManager(void)
+--- a/src/fqdncache.h
++++ b/src/fqdncache.h
+@@ -32,5 +32,8 @@
+ const char *fqdncache_gethostbyaddr(const Ip::Address &, int flags);
+ void fqdncache_nbgethostbyaddr(const Ip::Address &, FQDNH *, void *);
+ 
++/// offline ACL simulator rDNS behaviour; see ipcache_simulator_mode
++extern int fqdncache_simulator_mode;
++
+ #endif /* SQUID_FQDNCACHE_H_ */
+ 
+--- a/src/globals.h
++++ b/src/globals.h
+@@ -110,6 +110,7 @@
+ extern int opt_send_signal; /* -1 */
+ extern int opt_no_daemon; /* 0 */
+ extern int opt_parse_cfg_only; /* 0 */
++extern int opt_simulate; /* 0 */
+ 
+ /// current Squid process number (e.g., 4).
+ /// Zero for SMP-unaware code and in no-SMP mode.
+--- a/src/ipcache.cc
++++ b/src/ipcache.cc
+@@ -26,6 +26,11 @@
+ #include "util.h"
+ #include "wordlist.h"
+ 
++#include <algorithm>
++#include <set>
++#include <string>
++#include <vector>
++
+ #if SQUID_SNMP
+ #include "snmp_core.h"
+ #endif
+@@ -132,6 +137,9 @@
+ static ipcache_entry *ipcache_get(const char *);
+ static void ipcacheLockEntry(ipcache_entry *);
+ static void ipcacheStatPrint(ipcache_entry *, StoreEntry *);
++static const ipcache_addrs *ipcacheSimulatorLookup(const char *name);
++
++int ipcache_simulator_mode = 0;
+ static void ipcacheUnlockEntry(ipcache_entry *);
+ static void ipcacheRelease(ipcache_entry *, bool dofree = true);
+ 
+@@ -639,6 +647,9 @@
+     }
+ 
+     ++IpcacheStats.misses;
++
++    if (ipcache_simulator_mode)
++        return (flags & IP_LOOKUP_IF_MISS) ? ipcacheSimulatorLookup(name) : NULL;
+ 
+     if (flags & IP_LOOKUP_IF_MISS)
+         ipcache_nbgethostbyname(name, NULL, NULL);
+@@ -1072,6 +1083,58 @@
+     return 0;
+ }
+ 
++/// ACL simulator replacement for async DNS: resolves synchronously (mode 2)
++/// and caches the answer as a static entry, or gives up (mode 1)
++static const ipcache_addrs *
++ipcacheSimulatorLookup(const char *name)
++{
++    if (ipcache_simulator_mode != 2)
++        return NULL;
++
++    static std::set<std::string> failed; // do not repeat blocking lookups that failed
++    if (failed.count(name))
++        return NULL;
++
++    struct addrinfo hints;
++    memset(&hints, 0, sizeof(hints));
++    hints.ai_family = Ip::EnableIpv6 ? AF_UNSPEC : AF_INET;
++    hints.ai_socktype = SOCK_STREAM;
++    struct addrinfo *res = NULL;
++    if (getaddrinfo(name, NULL, &hints, &res) != 0 || !res) {
++        debugs(14, 3, "simulator: cannot resolve " << name);
++        failed.insert(name);
++        return NULL;
++    }
++
++    std::vector<Ip::Address> found;
++    for (const struct addrinfo *ai = res; ai && found.size() < 32; ai = ai->ai_next) {
++        Ip::Address a;
++        if (!(a = *ai))
++            continue;
++        a.port(0);
++        if (std::find(found.begin(), found.end(), a) == found.end())
++            found.push_back(a);
++    }
++    freeaddrinfo(res);
++    if (found.empty()) {
++        failed.insert(name);
++        return NULL;
++    }
++
++    ipcache_entry *i = new ipcache_entry(name);
++    i->addrs.count = found.size();
++    i->addrs.cur = 0;
++    i->addrs.badcount = 0;
++    i->addrs.in_addrs = static_cast<Ip::Address *>(xcalloc(found.size(), sizeof(Ip::Address)));
++    i->addrs.bad_mask = (unsigned char *)xcalloc(found.size(), sizeof(unsigned char));
++    for (size_t k = 0; k < found.size(); ++k)
++        i->addrs.in_addrs[k] = found[k];
++    i->flags.fromhosts = true;
++    ipcacheAddEntry(i);
++    ipcacheLockEntry(i);
++    return &i->addrs;
++}
++
+ #if SQUID_SNMP
+ /**
+  \ingroup IPCacheAPI
+--- a/src/ipcache.h
++++ b/src/ipcache.h
+@@ -41,5 +41,10 @@
+ void ipcache_restart(void);
+ int ipcacheAddEntryFromHosts(const char *name, const char *ipaddr);
+ 
++/// offline ACL simulator DNS behaviour (squid --simulate):
++/// 0 = normal async DNS, 1 = no lookups (hosts_file only),
++/// 2 = blocking system resolver (getaddrinfo) on cache misses
++extern int ipcache_simulator_mode;
++
+ #endif /* _SQUID_IPCACHE_H */
+ 
+--- a/src/main.cc
++++ b/src/main.cc
+@@ -135,6 +135,9 @@
+ #include <sys/wait.h>
+ #endif
+ 
++// offline http_access simulator (squid --simulate, --optimize)
++#include "AclSimulator.cci"
++
+ #if USE_WIN32_SERVICE
+ #include <process.h>
+ 
+@@ -404,7 +407,24 @@
+             "       -R        Do not set REUSEADDR on port.\n"
+             "       -S        Double-check swap during rebuild.\n"
+             "       -X        Force full debugging.\n"
+-            "       -Y        Only return UDP_HIT or UDP_MISS_NOFETCH during fast reload.\n",
++            "       -Y        Only return UDP_HIT or UDP_MISS_NOFETCH during fast reload.\n"
++            "       --simulate access.log|-\n"
++            "                 Parse configuration file, replay the log through http_access\n"
++            "                 without any network traffic, report the deciding rules and exit.\n"
++            "                 Log format: %%tl %%la %%>a \"%%rm %%ru HTTP/%%rv\" %%>Hs %%<st %%Ss:%%Sh\n"
++            "       --sim-trace\n"
++            "                 Also show every evaluated rule and ACL.\n"
++            "       --sim-dns off|system\n"
++            "                 off (default): only hosts_file; system: blocking resolver.\n"
++            "       --sim-port port\n"
++            "                 Local port of simulated requests (default: first http_port).\n"
++            "       --sim-compare new-squid.conf\n"
++            "                 Also replay through another squid.conf and list what changes.\n"
++            "       --report file.html\n"
++            "                 Write a full HTML report.\n"
++            "       --optimize\n"
++            "                 Find redundant, unused, unreachable, or redefined built-in\n"
++            "                 ACLs and http_access rules (works with or without --simulate).\n",
+             APP_SHORTNAME, CACHE_HTTP_PORT, DEFAULT_CONFIG_FILE, CACHE_ICP_PORT);
+     exit(EXIT_FAILURE);
+ }
+@@ -415,7 +435,14 @@
+     // not be used: Values below 2 are for special getopt_long(3) use cases, and
+     // values in the [33,126] range are reserved for short options (-x).
+     optForeground = 2,
+-    optKid
++    optKid,
++    optSimulate,
++    optSimTrace,
++    optSimDns,
++    optSimPort,
++    optSimCompare,
++    optReport,
++    optOptimize
+ };
+ 
+ // short options
+@@ -431,6 +458,13 @@
+ static struct option squidOptions[] = {
+     {"foreground", no_argument, 0,  optForeground},
+     {"kid",        required_argument, 0, optKid},
++    {"simulate",   required_argument, 0, optSimulate},
++    {"sim-trace",  no_argument, 0, optSimTrace},
++    {"sim-dns",    required_argument, 0, optSimDns},
++    {"sim-port",   required_argument, 0, optSimPort},
++    {"sim-compare", required_argument, 0, optSimCompare},
++    {"report",     required_argument, 0, optReport},
++    {"optimize",   no_argument, 0, optOptimize},
+     {"help",       no_argument, 0, 'h'},
+     {"version",    no_argument, 0, 'v'},
+     {0, 0, 0, 0}
+@@ -708,6 +742,45 @@
+ 
+     case optKid:
+         // already processed in ConfigureCurrentKid()
++        break;
++
++    case optSimulate:
++        /** \par --simulate
++         * Replay an access.log through http_access rules and exit */
++        AclSimulator::LogFile = optValue;
++        Acl::CollectConfigNotes = true; // before squid.conf is parsed
++        opt_simulate = 1;
++        break;
++
++    case optSimTrace:
++        AclSimulator::ShowTrace = true;
++        break;
++
++    case optSimDns:
++        if (!strcmp(optValue, "off"))
++            AclSimulator::DnsMode = 1;
++        else if (!strcmp(optValue, "system"))
++            AclSimulator::DnsMode = 2;
++        else
++            fatalf("--sim-dns expects 'off' or 'system' but got: %s", optValue);
++        break;
++
++    case optSimPort:
++        AclSimulator::LocalPortOption = xatoi(optValue);
++        break;
++
++    case optSimCompare:
++        AclSimulator::CompareConf = optValue;
++        break;
++
++    case optReport:
++        AclSimulator::ReportFile = optValue;
++        break;
++
++    case optOptimize:
++        AclSimulator::Optimize = true;
++        Acl::CollectConfigNotes = true; // before squid.conf is parsed
++        opt_simulate = 1;
+         break;
+ 
+     case 'h':
+@@ -1582,6 +1655,14 @@
+         if (opt_parse_cfg_only || parse_err > 0)
+             return parse_err;
+     }
++
++    if (AclSimulator::LogFile || AclSimulator::Optimize)
++        return AclSimulator::Run();
++    if (AclSimulator::CompareConf || AclSimulator::ReportFile) {
++        std::cerr << "--sim-compare and --report need --simulate or --optimize" << std::endl;
++        return 1;
++    }
++
+     setUmask(Config.umask);
+ 
+     // Master optimization: Where possible, avoid pointless daemon fork() and/or
+--- a/src/acl/Acl.cc
++++ b/src/acl/Acl.cc
+@@ -25,9 +25,75 @@
+ #include "SquidConfig.h"
+ 
+ #include <algorithm>
++#include <cctype>
+ #include <map>
+ 
+ const char *AclMatchedName = NULL;
++
++bool Acl::CollectConfigNotes = false;
++std::vector<Acl::ConfigNote> Acl::ConfigNotes;
++std::map<std::string, unsigned> Acl::AclReferences;
++std::set<std::string> Acl::PredefinedAcls;
++
++/// the ACL whose values are being parsed now (or nil)
++static const char *ParsingAcl = nullptr;
++/// the type of ParsingAcl
++static const char *ParsingAclType = nullptr;
++/// values of each ACL seen so far, for duplicate detection
++static std::map<std::string, std::set<std::string> > SeenValues;
++
++/// whether we are parsing Squid's built-in defaults rather than squid.conf
++static bool
++ParsingDefaults()
++{
++    return cfg_filename && strncmp(cfg_filename, "Default Configuration", 21) == 0;
++}
++
++void
++Acl::NoteConfig(const char *kind, const std::string &message, const char *aclName, const char *aclType)
++{
++    if (!CollectConfigNotes || ParsingDefaults())
++        return;
++    if (!aclName) {
++        aclName = ParsingAcl;
++        aclType = ParsingAclType;
++    }
++    if (!aclName)
++        return; // not parsing (e.g., matching uses the same comparison code)
++    ConfigNote note;
++    note.kind = kind;
++    note.acl = aclName;
++    note.type = aclType ? aclType : "";
++    note.where = std::string(cfg_filename ? cfg_filename : "?") + ":" + std::to_string(config_lineno);
++    note.line = config_input_line;
++    note.message = message;
++    ConfigNotes.push_back(note);
++}
++
++bool
++Acl::SeenValue(const std::string &value)
++{
++    return CollectConfigNotes && ParsingAcl && !SeenValues[ParsingAcl].insert(value).second;
++}
++
++void
++Acl::NoteReference(const char *aclName)
++{
++    if (!CollectConfigNotes)
++        return;
++    std::string key(aclName);
++    for (auto &c : key)
++        c = tolower(static_cast<unsigned char>(c)); // ACL names are case-insensitive
++    ++AclReferences[key];
++}
++
++void
++Acl::ClearConfigNotes()
++{
++    ConfigNotes.clear();
++    AclReferences.clear();
++    SeenValues.clear();
++}
+ 
+ namespace Acl {
+ 
+@@ -223,6 +289,7 @@
+     } else if (strcmp(theType, "proto") == 0 && strcmp(aclname, "manager") == 0) {
+         // ACL manager is now a built-in and has a different type.
+         debugs(28, DBG_PARSE_NOTE(DBG_IMPORTANT), "UPGRADE: ACL 'manager' is now a built-in ACL. Remove it from your config file.");
++        Acl::NoteConfig("predefined", "'manager' is a built-in ACL; Squid ignores this line", aclname, theType);
+         return; // ignore the line
+     }
+ 
+@@ -231,7 +298,12 @@
+         A = Acl::Make(theType);
+         A->context(aclname, config_input_line);
+         new_acl = 1;
++        if (ParsingDefaults())
++            Acl::PredefinedAcls.insert(aclname);
+     } else {
++        if (Acl::PredefinedAcls.count(aclname))
++            Acl::NoteConfig("predefined", std::string("'") + aclname + "' is a built-in ACL (" +
++                            (A->cfgline ? A->cfgline : "") + "); this line only adds to it", aclname, theType);
+         if (strcmp (A->typeString(),theType) ) {
+             debugs(28, DBG_CRITICAL, "aclParseAclLine: ACL '" << A->name << "' already exists with different type.");
+             parser.destruct();
+@@ -251,7 +323,11 @@
+     A->parseFlags();
+ 
+     /*split the function here */
++    ParsingAcl = A->name;
++    ParsingAclType = A->typeString();
+     A->parse();
++    ParsingAcl = nullptr;
++    ParsingAclType = nullptr;
+ 
+     /*
+      * Clear AclMatchedName from our temporary hack
+--- a/src/acl/Acl.h
++++ b/src/acl/Acl.h
+@@ -17,7 +17,11 @@
+ #include "sbuf/forward.h"
+ 
+ #include <algorithm>
++#include <map>
+ #include <ostream>
++#include <set>
++#include <string>
++#include <vector>
+ 
+ class ConfigParser;
+ 
+@@ -29,6 +33,36 @@
+ typedef ACL *(*Maker)(TypeName typeName);
+ /// use the given ACL Maker for all ACLs of the named type
+ void RegisterMaker(TypeName typeName, Maker maker);
++
++/// a questionable "acl" line detail noticed while parsing (squid --optimize)
++class ConfigNote
++{
++public:
++    std::string kind; ///< predefined, covered, duplicate, or universal
++    std::string acl; ///< ACL name
++    std::string type; ///< ACL type (e.g., dstdomain)
++    std::string where; ///< file:line
++    std::string line; ///< squid.conf line
++    std::string message;
++};
++
++/// whether parsing records the notes below (squid --simulate/--optimize only)
++extern bool CollectConfigNotes;
++/// notes collected since the last ClearConfigNotes()
++extern std::vector<ConfigNote> ConfigNotes;
++/// how many times each (lowercased) ACL name is used by directives and other ACLs
++extern std::map<std::string, unsigned> AclReferences;
++/// names of ACLs created by Squid's own default configuration
++extern std::set<std::string> PredefinedAcls;
++
++/// records a note about the given (or the currently parsed) ACL
++void NoteConfig(const char *kind, const std::string &message, const char *aclName = nullptr, const char *aclType = nullptr);
++/// whether the currently parsed ACL already had this value; remembers it
++bool SeenValue(const std::string &value);
++/// counts one use of the named ACL by a directive or another ACL
++void NoteReference(const char *aclName);
++/// forgets notes, references, and seen values (before parsing another squid.conf)
++void ClearConfigNotes();
+ 
+ } // namespace Acl
+ 
+--- a/src/acl/Checklist.cc
++++ b/src/acl/Checklist.cc
+@@ -53,6 +53,9 @@
+     cbdataReferenceDone(accessList);
+     checkCallback(currentAnswer());
+ }
++
++ACLChecklist::TraceHook *ACLChecklist::Tracer = nullptr;
++int ACLChecklist::SkipRulesThrough = -1;
+ 
+ void
+ ACLChecklist::markFinished(const allow_t &finalAnswer, const char *reason)
+@@ -105,6 +108,8 @@
+         matchPath.push(Breadcrumb(current, pos));
+     } else {
+         asyncLoc_.clear();
++        if (Tracer)
++            Tracer(this, current, child, result ? 1 : 0);
+     }
+ 
+     matchLoc_.clear();
+@@ -121,6 +126,8 @@
+     // TODO: add a once-in-a-while WARNING about fast directive using slow ACL?
+     if (!asyncCaller_) {
+         debugs(28, 2, this << " a fast-only directive uses a slow ACL!");
++        if (Tracer)
++            Tracer(this, matchLoc_.parent, *matchLoc_.position, -1);
+         return false;
+     }
+ 
+--- a/src/acl/Checklist.h
++++ b/src/acl/Checklist.h
+@@ -141,6 +141,15 @@
+     /// Matches (or resumes matching of) a child node while maintaning
+     /// resumption breadcrumbs if a [grand]child node goes async.
+     bool matchChild(const Acl::InnerNode *parent, Acl::Nodes::const_iterator pos, const ACL *child);
++
++    /// Observer of individual node matching results, used by the offline
++    /// ACL simulator (squid --simulate). The result is 1 (match), 0 (mismatch),
++    /// or -1 (a slow ACL needed an async lookup that this check cannot do).
++    typedef void TraceHook(const ACLChecklist *, const Acl::InnerNode *parent, const ACL *child, int result);
++    static TraceHook *Tracer; ///< nil unless simulating
++    /// simulator: Acl::Tree ignores its rules at positions [0, SkipRulesThrough]
++    /// so that the rules matching after the decisive one can be found (-1: off)
++    static int SkipRulesThrough;
+ 
+     /// Whether we should continue to match tree nodes or stop/pause.
+     bool keepMatching() const { return !finished() && !asyncInProgress(); }
+--- a/src/acl/DomainData.cc
++++ b/src/acl/DomainData.cc
+@@ -9,6 +9,7 @@
+ /* DEBUG: section 28    Access Control */
+ 
+ #include "squid.h"
++#include "acl/Acl.h"
+ #include "acl/Checklist.h"
+ #include "acl/DomainData.h"
+ #include "anyp/Uri.h"
+@@ -80,6 +81,7 @@
+             bool d3big = (strlen(d3) > strlen(d4)); // Always suggest removing the longer one.
+             debugs(28, DBG_IMPORTANT, "WARNING: '" << (d3big?d3:d4) << "' is a subdomain of '" << (d3big?d4:d3) << "'");
+             debugs(28, DBG_IMPORTANT, "WARNING: You should remove '" << (d3big?d3:d4) << "' from the ACL named '" << AclMatchedName << "'");
++            Acl::NoteConfig("covered", std::string("'") + (d3big?d3:d4) + "' is already covered by '" + (d3big?d4:d3) + "'");
+             debugs(28, 2, HERE << "Ignore '" << d3 << "' to keep splay tree searching predictable");
+         }
+     } else if (ret == 0) {
+@@ -87,6 +89,7 @@
+         if (strcmp(d1,d2)==0) {
+             debugs(28, 2, "WARNING: '" << d2 << "' is duplicated in the list.");
+             debugs(28, 2, "WARNING: You should remove one '" << d2 << "' from the ACL named '" << AclMatchedName << "'");
++            Acl::NoteConfig("duplicate", std::string("'") + d2 + "' is listed more than once");
+             return ret;
+         }
+         // When a.example.com comes before .example.com in an ACL
+--- a/src/acl/InnerNode.cc
++++ b/src/acl/InnerNode.cc
+@@ -62,6 +62,7 @@
+             self_destruct();
+             return;
+         }
++        Acl::NoteReference(t);
+ 
+         // append(negated ? new NotNode(a) : a);
+         if (negated)
+--- a/src/acl/Ip.cc
++++ b/src/acl/Ip.cc
+@@ -9,6 +9,7 @@
+ /* DEBUG: section 28    Access Control */
+ 
+ #include "squid.h"
++#include "acl/Acl.h"
+ #include "acl/Checklist.h"
+ #include "acl/Ip.h"
+ #include "cache_cf.h"
+@@ -142,6 +143,10 @@
+         debugs(28, DBG_CRITICAL, "WARNING: (" << (bina?'B':'A') << ") '" << buf_n1 << "' is a subnetwork of (" << (bina?'A':'B') << ") '" << buf_n2 << "'");
+         debugs(28, DBG_CRITICAL, "WARNING: because of this '" << (bina?buf_n2:buf_n1) << "' is ignored to keep splay tree searching predictable");
+         debugs(28, DBG_CRITICAL, "WARNING: You should probably remove '" << buf_n1 << "' from the ACL named '" << AclMatchedName << "'");
++        if (strcmp(buf_n1, buf_n2) == 0)
++            Acl::NoteConfig("duplicate", std::string("'") + buf_n1 + "' is listed more than once");
++        else
++            Acl::NoteConfig("covered", std::string("'") + buf_n1 + "' is already covered by '" + buf_n2 + "'");
+     }
+ 
+     return ret;
+--- a/src/acl/RegexData.cc
++++ b/src/acl/RegexData.cc
+@@ -243,6 +243,12 @@
+         } else {
+             debugs(28, 3, "buffering RE '" << clean << "'");
+             sl.emplace_back(clean);
++            if (!strcmp(clean, "-i") || !strcmp(clean, "+i"))
++                continue; // flags, not patterns
++            if (!strcmp(clean, ".*") || !strcmp(clean, ".") || !strcmp(clean, "^"))
++                Acl::NoteConfig("universal", std::string("regular expression '") + t + "' matches every value");
++            else if (Acl::SeenValue(clean))
++                Acl::NoteConfig("duplicate", std::string("regular expression '") + clean + "' is listed more than once");
+         }
+     }
+ 
+--- a/src/acl/Tree.cc
++++ b/src/acl/Tree.cc
+@@ -60,9 +60,11 @@
+ bool
+ Acl::Tree::bannedAction(ACLChecklist *checklist, Nodes::const_iterator node) const
+ {
++    const Nodes::size_type pos = node - nodes.begin();
++    if (ACLChecklist::SkipRulesThrough >= 0 && pos <= Nodes::size_type(ACLChecklist::SkipRulesThrough))
++        return true;
+     if (actions.size()) {
+         assert(actions.size() == nodes.size());
+-        const Nodes::size_type pos = node - nodes.begin();
+         return checklist->bannedAction(actions.at(pos));
+     }
+     return false;

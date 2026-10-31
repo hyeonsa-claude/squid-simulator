@@ -1,0 +1,10 @@
+# squid -f tests/squid.conf --optimize
+# Each line: severity|category|subject (substring) that must appear in the findings.
+LOW|covered by a wider entry|localnet
+LOW|covered by a wider entry|blocked
+MEDIUM|built-in ACL redefined|localhost
+LOW|unused ACL|unused_acl
+LOW|identical ACLs|dup
+MEDIUM|redundant rule|http_access#7
+MEDIUM|redundant rule|http_access#11
+HIGH|unreachable rule|http_access#12

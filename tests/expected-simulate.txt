@@ -1,0 +1,14 @@
+# squid -f tests/squid.conf --simulate tests/access.log
+# line  verdict  deciding-rule        vs-log   (vs-log "*" = not checked)
+3   ALLOW  http_access#5    same
+4   DENY   http_access#3    same
+5   DENY   http_access#1    same
+6   ALLOW  http_access#5    same
+7   DENY   http_access#1    same
+8   DENY   http_access#4    same
+9   ALLOW  http_access#5    same
+10  DENY   http_access#10   UNSURE
+11  SKIP   -                *
+12  SKIP   -                *
+13  DENY   http_access#3    DIFF
+14  ALLOW  http_access#5    same

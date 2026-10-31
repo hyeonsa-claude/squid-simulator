@@ -1,0 +1,5 @@
+# squid -f tests/squid.conf --simulate tests/access.log --sim-compare tests/squid-new.conf
+# Only these lines may change. line  current  new    kind
+8   DENY   DENY   rule
+9   ALLOW  DENY   VERDICT
+10  DENY   ALLOW  VERDICT
