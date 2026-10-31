@@ -60,18 +60,22 @@ else
     fail "changed lines differ:"; sed 's/^/        /' "$OUT/compare.diff"
 fi
 
-# 4. optimizer findings
-echo "[optimize] --optimize"
-"$SQUID" -f "$T/squid.conf" --optimize > "$OUT/optimize.txt" 2> "$OUT/optimize.err"
-echo "  exit $?"
-while IFS='|' read -r severity category subject; do
-    case "$severity" in ''|\#*) continue ;; esac
-    if grep -E "^  $severity +$category +.*$subject" "$OUT/optimize.txt" > /dev/null; then
-        pass "$severity $category $subject"
-    else
-        fail "missing finding: $severity $category $subject"
-    fi
-done < "$T/expected-optimize.txt"
+# 4. optimizer findings (config:expected pairs; the second exists on branches that need it)
+for pair in squid.conf:expected-optimize.txt optimize-extra.conf:expected-optimize-extra.txt; do
+    conf=${pair%%:*} want=${pair##*:}
+    [ -f "$T/$want" ] || continue
+    echo "[optimize] --optimize ($conf)"
+    "$SQUID" -f "$T/$conf" --optimize > "$OUT/optimize-$conf.txt" 2> "$OUT/optimize-$conf.err"
+    echo "  exit $?"
+    while IFS='|' read -r severity category subject; do
+        case "$severity" in ''|\#*) continue ;; esac
+        if grep -E "^  $severity +$category +.*$subject" "$OUT/optimize-$conf.txt" > /dev/null; then
+            pass "$severity $category $subject"
+        else
+            fail "missing finding: $severity $category $subject"
+        fi
+    done < "$T/$want"
+done
 
 # 5. HTML report
 echo "[report] --report"

@@ -40,10 +40,10 @@
 7.7에서 `ident`, `ident_regex`가 제거되었고, 다음 타입이 `UNSURE` 목록에 추가되었습니다:
 `annotate_client`, `annotate_transaction`, `squid_error`, `connections_encrypted`, `snmp_community`.
 
-## 7.7에서 확인할 것
+## 26.04 실기에서 확인한 것
 
-이 항목들은 26.04 테스트 머신에서 `scripts/verify-target.sh`로 확인합니다.
+Ubuntu 26.04.1 LTS에서 `scripts/verify-target.sh`로 모두 확인했고, 앞의 두 항목은 `tests/optimize-extra.conf`로 자동 테스트합니다.
 
-- `src all`의 `dump()` 출력 형식 (모든 요청에 매칭되는 ACL 판단에 사용)
-- 7.7의 겹침 병합 경고가 테스트 설정에서 기대대로 나오는지
-- Ubuntu 기본 설정 패치 적용 후 `-k parse` 결과가 배포판 squid와 같은지
+- `src 0.0.0.0/0`을 모든 요청에 매칭되는 ACL로 인식함
+- 7.7의 범위 병합이 `overlapping entries`로 보고됨
+- Ubuntu 패치 적용 후 `-k parse` 결과가 배포판 squid 7.7과 같음 (테스트 설정 2개와 `/etc/squid/squid.conf`)

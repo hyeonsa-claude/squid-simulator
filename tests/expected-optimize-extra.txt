@@ -1,0 +1,5 @@
+# squid -f tests/optimize-extra.conf --optimize   (squid 7.x)
+HIGH|unreachable rule|http_access#3
+MEDIUM|redundant rule|http_access#2
+LOW|duplicate entry|office
+LOW|overlapping entries|range

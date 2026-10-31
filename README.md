@@ -12,7 +12,7 @@ Squid 내부 API가 버전마다 달라서, 배포판의 squid 버전마다 브�
 | 브랜치 | 대상 OS | squid | 상태 |
 |---|---|---|---|
 | `main` | Ubuntu 20.04 LTS | 4.10 | 빌드·`make check`·기능 테스트 통과 ([docs/VERIFICATION.md](docs/VERIFICATION.md)) |
-| `ubuntu-26.04-squid-7.7` | Ubuntu 26.04 LTS | 7.7 (26.04 업데이트 기준, 출시 시 7.2) | 이식 완료. 20.04에서 7.7 빌드·`make check`·기능 테스트 통과, 26.04 머신 검증 대기 ([docs/VERIFICATION.md](docs/VERIFICATION.md)) |
+| `ubuntu-26.04-squid-7.7` | Ubuntu 26.04 LTS | 7.7 (26.04 업데이트 기준, 출시 시 7.2) | Ubuntu 26.04.1 실기에서 빌드·`make check`(103 PASS)·기능 테스트 32개·배포판 squid 비교 통과 ([docs/VERIFICATION.md](docs/VERIFICATION.md)) |
 
 ## 빠른 시작 (이 브랜치: Ubuntu 26.04 / squid 7.7)
 
